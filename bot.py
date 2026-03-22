@@ -55,30 +55,31 @@ HELP_TEXT = """\
 `!match [N]`         – Letzte 5 (oder N) Ergebnisse
 `!gk`                – Als Torwart für dieses Spiel melden
 `!kein_gk`           – GK-Meldung zurückziehen
-`!team`              – Teams aus aktuellem Vote generieren
-`!help`              – Diese Hilfe anzeigen
+`!team`              – Teams aus dem aktuellen Vote generieren
+`!help`              – Diese Hilfe
 
-**Admin – Stammdaten**
-`!player add @user:srv Name [gk]`   – Spieler anlegen  (gk = Torwart-fähig)
-`!player set @user:srv 7.5`         – Feldspieler-Score setzen
-`!player set @user:srv field 7.5`   – Feldspieler-Score setzen (explizit)
-`!player set @user:srv gk 8.0`      – Torwart-Score setzen
-`!player gk @user:srv`              – GK-Fähigkeit ein/aus (Score bleibt)
-`!player del @user:srv`             – Spieler deaktivieren
+**Admin – Spieler-Stammdaten**
+`!player add @user:server Name`      – Spieler anlegen
+`!player add @user:server Name gk`   – Spieler anlegen (Torwart-fähig)
+`!player set @user:server 7.5`       – Feldspieler-Score setzen (Standard)
+`!player set @user:server field 7.5` – Feldspieler-Score setzen (explizit)
+`!player set @user:server gk 8.0`    – Torwart-Score setzen
+`!player gk @user:server`            – GK-Fähigkeit ein/aus (Score bleibt erhalten)
+`!player del @user:server`           – Spieler deaktivieren
 
 **Admin – Aktuelles Spiel**
-`!match change Name1 Name2`  – Zwei Spieler zwischen Teams tauschen
+`!match change Name1 Name2`  – Zwei Spieler zwischen den Teams tauschen
 `!match change Name`         – Spieler ins andere Team verschieben
 `!match gk Name`             – Spieler als Torwart seines Teams setzen
 `!match switched Name`       – Score-Wertung für Spieler ein-/ausschalten
 
-**Admin – Ergebnis**
-`!result 3:2`   – Ergebnis eintragen und Scores neu berechnen
-`!vote`         – Wöchentlichen Vote sofort starten
+**Admin – Ergebnis & Vote**
+`!result 3:2`  – Ergebnis eintragen und Scores neu berechnen
+`!vote`        – Wöchentlichen Vote sofort starten
 
-**GK-Zuweisung (automatisch)**
-① Freiwillige (`!gk`) nach GK-Score
-② Spieler mit GK-Fähigkeit nach GK-Score
+**Torwart-Zuweisung (automatisch bei !team)**
+① Freiwillige (`!gk`) sortiert nach GK-Score
+② Spieler mit GK-Fähigkeit sortiert nach GK-Score
 ③ Fallback: schwächster Feldspieler pro Team
 """
 
