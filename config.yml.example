@@ -1,0 +1,34 @@
+# TeamBot Konfiguration
+# Kopieren nach config.yml und anpassen
+
+# Matrix-Zugangsdaten
+homeserver: "https://matrix.example.org"
+user_id: "@teambot:example.org"
+password: "geheimes-passwort"
+room_id: "!raumid:example.org"
+
+# Admin-Nutzer (dürfen Scores ändern, Ergebnisse eintragen etc.)
+admin_users:
+  - "@admin1:example.org"
+  - "@admin2:example.org"
+
+# Datenbank
+db_path: "data/teambot.db"
+
+# Vote-Schedule: Samstag 12:00
+vote_weekday: 5    # 0=Mo … 6=So
+vote_hour: 12
+vote_minute: 0
+
+# Team-Generierung: Sonntag 09:00
+team_weekday: 6
+team_hour: 9
+team_minute: 0
+
+# Spielzeit im Vote-Titel
+game_hour: 10
+game_minute: 0
+
+# Reaktions-Emojis
+vote_yes: "✅"
+vote_no: "❌"

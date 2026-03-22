@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+  teambot:
+    build: .
+    container_name: teambot
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data          # SQLite-Datenbank persistieren
+      - ./config.yml:/app/config.yml:ro
+    environment:
+      - TZ=Europe/Berlin
+
+  # Web-API (optional, für spätere Phase aktivieren)
+  teambot-api:
+    build: .
+    container_name: teambot-api
+    restart: unless-stopped
+    command: uvicorn api:app --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./config.yml:/app/config.yml:ro
+    environment:
+      - TZ=Europe/Berlin
+      - DB_PATH=/app/data/teambot.db
+    depends_on:
+      - teambot
+    profiles:
+      - api                       # Nur starten mit: docker compose --profile api up
