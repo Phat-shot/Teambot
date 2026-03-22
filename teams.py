@@ -1,81 +1,171 @@
 """
-Team balancing – minimiert |sum(Team1) - sum(Team2)| exakt.
+Team balancing mit GK-Logik.
 
-Für N ≤ 22 Spieler ist C(22, 11) ≈ 700k – in <100ms lösbar.
-Bei größeren Gruppen wird greedy verwendet (Praxis: irrelevant).
+GK-Zuweisung (Priorität):
+  1. !gk-Freiwillige (nach score_gk sortiert, einer pro Team)
+  2. can_gk=True Spieler mit bestem score_gk (einer pro Team)
+  3. Spieler mit niedrigstem score_field pro Team (Fallback)
+
+Balancing der Feldspieler nach score_field (exakt kombinatorisch).
 """
 
 import random
 from itertools import combinations
-from typing import Dict, List, Tuple
-
-ROLE_EMOJI = {
-    "offensive": "⚔️",
-    "defensive": "🛡️",
-    "goalkeeper": "🧤",
-}
-TEAM_COLORS = ["🔴", "🔵"]
+from typing import Dict, List, Optional, Tuple
 
 
-def primary_score(player: Dict) -> float:
-    role = player.get("primary_role", "offensive")
-    return round(float(player.get(f"score_{role}", 5.0)), 2)
+# ------------------------------------------------------------------
+# GK assignment
+# ------------------------------------------------------------------
 
-
-def balance_teams(players: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+def assign_gks(
+    players: List[Dict],
+    gk_volunteers: List[str],   # matrix_ids die !gk geschrieben haben
+) -> Tuple[Optional[Dict], Optional[Dict], List[Dict]]:
     """
-    Split players into two teams with minimal score difference.
-    Team 1 gets ceil(N/2) players, Team 2 gets floor(N/2).
+    Returns (gk1, gk2, remaining_field_players).
+    gk1/gk2 may be None if not enough players.
     """
     n = len(players)
     if n < 2:
+        return None, None, players
+
+    by_id = {p["matrix_id"]: p for p in players}
+
+    # ① Freiwillige die auch im Vote sind
+    vols = [by_id[m] for m in gk_volunteers if m in by_id]
+    vols.sort(key=lambda p: p.get("score_gk", 5.0), reverse=True)
+
+    # ② can_gk Spieler (nicht bereits als Freiwillige)
+    vol_ids = {p["id"] for p in vols}
+    can_gk_players = sorted(
+        [p for p in players if p.get("can_gk") and p["id"] not in vol_ids],
+        key=lambda p: p.get("score_gk", 5.0),
+        reverse=True,
+    )
+
+    gk_pool = vols + can_gk_players
+
+    if len(gk_pool) >= 2:
+        gk1, gk2 = gk_pool[0], gk_pool[1]
+    elif len(gk_pool) == 1:
+        gk1 = gk_pool[0]
+        gk2 = None   # assigned later from field fallback
+    else:
+        gk1 = gk2 = None
+
+    # Remove assigned GKs from field players
+    assigned = {p["id"] for p in [gk1, gk2] if p}
+    field = [p for p in players if p["id"] not in assigned]
+
+    # ③ Fallback: if still need GKs, take worst field scorer
+    if gk1 is None and field:
+        fallback = min(field, key=lambda p: p.get("score_field", 5.0))
+        gk1 = fallback
+        field = [p for p in field if p["id"] != fallback["id"]]
+    if gk2 is None and field:
+        fallback = min(field, key=lambda p: p.get("score_field", 5.0))
+        gk2 = fallback
+        field = [p for p in field if p["id"] != fallback["id"]]
+
+    return gk1, gk2, field
+
+
+# ------------------------------------------------------------------
+# Field player balancing
+# ------------------------------------------------------------------
+
+def balance_field_players(
+    players: List[Dict],
+) -> Tuple[List[Dict], List[Dict]]:
+    """Split field players into two balanced halves by score_field."""
+    n = len(players)
+    if n == 0:
+        return [], []
+    if n == 1:
         return players, []
 
-    half = n // 2          # smaller half → Team 2
-    other = n - half       # larger half  → Team 1 (gets +1 if odd)
+    half = n // 2
 
     best_diff = float("inf")
-    best_team2_indices: frozenset = frozenset()
+    best_t2: frozenset = frozenset()
 
-    # Exhaustive search over all ways to choose `half` players for Team 2
     for combo in combinations(range(n), half):
-        t2_score = sum(primary_score(players[i]) for i in combo)
+        t2_score = sum(players[i].get("score_field", 5.0) for i in combo)
         t1_score = sum(
-            primary_score(players[i]) for i in range(n) if i not in combo
+            players[i].get("score_field", 5.0) for i in range(n) if i not in combo
         )
         diff = abs(t1_score - t2_score)
         if diff < best_diff:
             best_diff = diff
-            best_team2_indices = frozenset(combo)
+            best_t2 = frozenset(combo)
 
-    team1 = [players[i] for i in range(n) if i not in best_team2_indices]
-    team2 = [players[i] for i in best_team2_indices]
-
-    # Shuffle within teams for fairness
+    team1 = [players[i] for i in range(n) if i not in best_t2]
+    team2 = [players[i] for i in best_t2]
     random.shuffle(team1)
     random.shuffle(team2)
-
     return team1, team2
 
 
-def format_teams(team1: List[Dict], team2: List[Dict]) -> str:
-    t1_total = sum(primary_score(p) for p in team1)
-    t2_total = sum(primary_score(p) for p in team2)
-    diff = abs(t1_total - t2_total)
+# ------------------------------------------------------------------
+# Main entry point
+# ------------------------------------------------------------------
 
-    def player_line(p: Dict) -> str:
-        emoji = ROLE_EMOJI.get(p.get("primary_role", "offensive"), "⚽")
-        score = primary_score(p)
-        return f"  {emoji} {p['display_name']} ({score:.2f})"
+def build_teams(
+    players: List[Dict],
+    gk_volunteers: List[str],
+) -> Tuple[List[Dict], Optional[Dict], List[Dict], Optional[Dict]]:
+    """
+    Returns (team1_field, team1_gk, team2_field, team2_gk).
+    """
+    gk1, gk2, field = assign_gks(players, gk_volunteers)
+
+    # Balance field players, then assign one GK per team
+    t1_field, t2_field = balance_field_players(field)
+
+    return t1_field, gk1, t2_field, gk2
+
+
+# ------------------------------------------------------------------
+# Formatting
+# ------------------------------------------------------------------
+
+def format_teams(
+    t1_field: List[Dict],
+    gk1: Optional[Dict],
+    t2_field: List[Dict],
+    gk2: Optional[Dict],
+) -> str:
+    def gk_line(gk: Optional[Dict]) -> str:
+        if not gk:
+            return "  🧤 — (kein Torwart)"
+        score = gk.get("score_gk", 5.0)
+        tag = " ⭐" if gk.get("can_gk") else " (Fallback)"
+        return f"  🧤 {gk['display_name']} (GK {score:.2f}){tag}"
+
+    def field_line(p: Dict) -> str:
+        return f"  ⚽ {p['display_name']} ({p.get('score_field', 5.0):.2f})"
+
+    t1_total = sum(p.get("score_field", 5.0) for p in t1_field)
+    t2_total = sum(p.get("score_field", 5.0) for p in t2_field)
+
+    if gk1:
+        t1_total += gk1.get("score_gk", 5.0)
+    if gk2:
+        t2_total += gk2.get("score_gk", 5.0)
+
+    diff = abs(t1_total - t2_total)
 
     lines = [
         "⚽ **Mannschaften** ⚽",
         "",
         f"🔴 **Team 1**  |  Stärke: {t1_total:.2f}",
-        *[player_line(p) for p in team1],
+        gk_line(gk1),
+        *[field_line(p) for p in t1_field],
         "",
         f"🔵 **Team 2**  |  Stärke: {t2_total:.2f}",
-        *[player_line(p) for p in team2],
+        gk_line(gk2),
+        *[field_line(p) for p in t2_field],
         "",
         f"⚖️ Differenz: {diff:.2f}",
     ]
