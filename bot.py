@@ -22,6 +22,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from nio import (
     AsyncClient,
+    InviteMemberEvent,
     LoginResponse,
     RoomMessageText,
     RoomSendResponse,
@@ -80,6 +81,7 @@ class TeamBot:
 
         self.client.add_event_callback(self._on_message, RoomMessageText)
         self.client.add_event_callback(self._on_reaction, UnknownEvent)
+        self.client.add_event_callback(self._on_invite, InviteMemberEvent)
 
         self._setup_scheduler()
         self.scheduler.start()
@@ -170,25 +172,61 @@ class TeamBot:
             logger.exception("Error in command %s", cmd)
             await self.send(f"❌ Fehler beim Ausführen von `{cmd}`: {exc}")
 
-    async def _on_reaction(self, room, event):
-        if room.room_id != self.config.room_id:
+    async def _on_invite(self, room, event):
+        """Auto-join any room the bot is invited to."""
+        if event.membership != "invite":
             return
-        if event.type != "m.reaction":
+        if event.state_key != self.config.user_id:
+            return
+        logger.info("Invited to %s – joining …", room.room_id)
+        resp = await self.client.join(room.room_id)
+        if hasattr(resp, "room_id"):
+            logger.info("Joined room %s", resp.room_id)
+            # If this is the configured room, say hello
+            if resp.room_id == self.config.room_id:
+                await self.send("👋 TeamBot ist jetzt aktiv! Tippe `!help` für alle Befehle.")
+        else:
+            logger.error("Failed to join %s: %s", room.room_id, resp)
+
+    async def _on_reaction(self, room, event):
+        """Handle Matrix poll responses (MSC3381) and legacy emoji reactions."""
+        if room.room_id != self.config.room_id:
             return
         if event.sender == self.config.user_id:
             return
 
-        relates_to = event.source.get("content", {}).get("m.relates_to", {})
-        if relates_to.get("rel_type") != "m.annotation":
+        content = event.source.get("content", {})
+
+        # ── Native Matrix Poll response ──
+        if event.type in ("org.matrix.msc3381.poll.response", "m.poll.response"):
+            relates_to = content.get("m.relates_to", {})
+            poll_event_id = relates_to.get("event_id")
+            vote = await self.db.get_vote_by_event(poll_event_id)
+            if not vote or vote["closed"]:
+                return
+            answers = (
+                content.get("org.matrix.msc3381.poll.response", {})
+                or content.get("m.poll.response", {})
+            ).get("answers", [])
+            if "yes" in answers:
+                await self.db.upsert_vote_response(vote["id"], event.sender, "yes")
+                logger.info("Poll ✅  %s → vote %s", event.sender, vote["id"])
+            elif "no" in answers:
+                await self.db.upsert_vote_response(vote["id"], event.sender, "no")
+                logger.info("Poll ❌  %s → vote %s", event.sender, vote["id"])
             return
 
+        # ── Legacy emoji reaction ──
+        if event.type != "m.reaction":
+            return
+        relates_to = content.get("m.relates_to", {})
+        if relates_to.get("rel_type") != "m.annotation":
+            return
         target_event_id = relates_to.get("event_id")
         key = relates_to.get("key", "")
-
         vote = await self.db.get_vote_by_event(target_event_id)
         if not vote or vote["closed"]:
             return
-
         if key == self.config.vote_yes:
             await self.db.upsert_vote_response(vote["id"], event.sender, "yes")
             logger.info("✅  %s → vote %s", event.sender, vote["id"])
@@ -381,37 +419,66 @@ class TeamBot:
     # ------------------------------------------------------------------
 
     async def _scheduled_vote(self):
-        """Post the weekly vote message (triggered Saturday 12:00)."""
+        """Post the weekly vote as a native Matrix poll (MSC3381)."""
         now = datetime.now()
 
-        # Calculate next Sunday's date
-        days_ahead = (6 - now.weekday()) % 7  # 6 = Sunday
+        # Next Sunday
+        days_ahead = (6 - now.weekday()) % 7
         if days_ahead == 0:
             days_ahead = 7
-        # If today IS Saturday the game is tomorrow
-        if now.weekday() == 5:
+        if now.weekday() == 5:   # Saturday → game is tomorrow
             days_ahead = 1
         game_date = now + timedelta(days=days_ahead)
 
         game_date_str = game_date.strftime("%d.%m.%Y")
         cfg = self.config
-
-        msg = (
-            f"🗳️ **Kicken Morgen, {game_date_str} um "
-            f"{cfg.game_hour:02d}:{cfg.game_minute:02d} Uhr**\n\n"
-            f"{cfg.vote_yes} Dabei      {cfg.vote_no} Nicht dabei"
+        title = (
+            f"Kicken Morgen, {game_date_str} um "
+            f"{cfg.game_hour:02d}:{cfg.game_minute:02d} Uhr"
         )
 
-        event_id = await self.send(msg)
-        if event_id:
+        # MSC3381 poll – supported by Element, FluffyChat, Cinny etc.
+        poll_content = {
+            "msgtype": "m.text",
+            "body": f"📊 {title}\n✅ Dabei / ❌ Nicht dabei",
+            # Stable (Matrix 1.7+)
+            "org.matrix.msc3381.poll.start": {
+                "kind": "org.matrix.msc3381.poll.disclosed",
+                "max_selections": 1,
+                "question": {"body": f"⚽ {title}"},
+                "answers": [
+                    {"id": "yes", "org.matrix.msc3381.poll.answer.text": "✅ Dabei"},
+                    {"id": "no",  "org.matrix.msc3381.poll.answer.text": "❌ Nicht dabei"},
+                ],
+            },
+            # Unstable fallback (older Element versions)
+            "m.poll.start": {
+                "kind": "m.poll.disclosed",
+                "max_selections": 1,
+                "question": {"body": f"⚽ {title}"},
+                "answers": [
+                    {"id": "yes", "m.text": "✅ Dabei"},
+                    {"id": "no",  "m.text": "❌ Nicht dabei"},
+                ],
+            },
+        }
+
+        resp = await self.client.room_send(
+            self.config.room_id,
+            "org.matrix.msc3381.poll.start",
+            poll_content,
+        )
+
+        if isinstance(resp, RoomSendResponse):
+            event_id = resp.event_id
             vote_date = game_date.strftime("%Y-%m-%d")
             vote_id = await self.db.create_vote(event_id, vote_date)
             logger.info(
-                "Vote started – event_id=%s  vote_id=%d  date=%s",
+                "Poll started – event_id=%s  vote_id=%d  date=%s",
                 event_id, vote_id, vote_date,
             )
         else:
-            logger.error("Failed to post vote message")
+            logger.error("Failed to post poll: %s", resp)
 
     async def _scheduled_teams(self):
         """Auto-generate teams on Sunday 09:00."""
