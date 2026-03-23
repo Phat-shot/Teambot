@@ -10,7 +10,11 @@ class Config:
     password: str
     room_id: str        # Hauptraum (Announcements + öffentliche Befehle)
     admin_room_id: str = ""  # Admin-Raum (leer = kein dedizierter Admin-Raum)
-    poll_sender: str = ""   # Matrix-ID über die Polls gesendet werden (für WA-Bridge), leer = Bot selbst
+
+    # Optionaler zweiter Account für Poll-Versand (WA-Bridge-Workaround)
+    # Wenn gesetzt, werden Polls von diesem User gesendet statt vom Bot
+    poll_sender_id: str = ""        # z.B. @phil:matrix.srz.one
+    poll_sender_password: str = ""  # Passwort des Poll-Senders
 
     # Storage
     db_path: str = "data/teambot.db"

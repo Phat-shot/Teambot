@@ -1,35 +1,29 @@
-# TeamBot Konfiguration
-# Kopieren nach config.yml und anpassen
+homeserver: "https://matrix.srz.one"
+user_id: "@teambot:matrix.srz.one"
+password: "dein-bot-passwort"
+room_id: "!HAUPTRAUM-ID:matrix.srz.one"
+admin_room_id: "!ADMIN-RAUM-ID:matrix.srz.one"
 
-# Matrix-Zugangsdaten
-homeserver: "https://matrix.example.org"
-user_id: "@teambot:example.org"
-password: "geheimes-passwort"
-
-# Hauptraum – hier werden Vote, Teams und Ergebnisse gepostet
-room_id: "!hauptraum:example.org"
-
-# Admin-Raum – alle Mitglieder dieses Raumes haben Admin-Rechte
-# Einfach einen privaten Raum erstellen und die gewünschten Admins einladen
-admin_room_id: "!adminraum:example.org"
-
-# Datenbank
 db_path: "data/teambot.db"
 
-# Vote-Schedule: Samstag 12:00
-vote_weekday: 5    # 0=Mo … 6=So
+# Spieltag-Einstellungen
+vote_weekday: 5    # 0=Mo … 6=So (5=Samstag)
 vote_hour: 12
 vote_minute: 0
 
-# Team-Generierung: Sonntag 09:00
-team_weekday: 6
+team_weekday: 6    # Sonntag
 team_hour: 9
 team_minute: 0
 
-# Spielzeit im Vote-Titel
 game_hour: 10
 game_minute: 0
 
-# Reaktions-Emojis
+# Abstimmungs-Emojis
 vote_yes: "✅"
 vote_no: "❌"
+
+# Optionaler zweiter Account für Poll-Versand (WA-Bridge-Workaround)
+# Polls werden von diesem User gesendet damit die WA-Bridge sie akzeptiert.
+# Leer lassen wenn nicht benötigt.
+poll_sender_id: "@phil:matrix.srz.one"
+poll_sender_password: "dein-phil-passwort"
