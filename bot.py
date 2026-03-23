@@ -1191,34 +1191,58 @@ class TeamBot:
 
     async def _post_poll(self, room_id: str, content: dict) -> Optional[str]:
         """Poll posten – wenn poll_sender gesetzt, als diesen User senden (WA-Bridge Workaround)."""
-        poll_sender = self.config.poll_sender
+        import uuid
+        import json
+        import aiohttp
 
+        poll_sender = self.config.poll_sender
+        tx_id = uuid.uuid4().hex
+
+        # URL bauen
+        homeserver = self.config.homeserver.rstrip("/")
+        encoded_room = room_id.replace("!", "%21").replace(":", "%3A")
+        encoded_type = POLL_EVENT_TYPE.replace(".", "%2E").replace("/", "%2F")
+        url = f"{homeserver}/_matrix/client/v3/rooms/{encoded_room}/send/{POLL_EVENT_TYPE}/{tx_id}"
+
+        params = {"access_token": self.client.access_token}
         if poll_sender:
-            # Appservice-Impersonation: user_id im Query-Parameter
-            # nio's Api._build_path mit zusätzlichem user_id Parameter
-            from uuid import uuid4
-            from nio.api import Api
-            from nio.responses import RoomSendResponse as RSR
-            tx_id = uuid4()
-            query_params = {
-                "access_token": self.client.access_token,
-                "user_id": poll_sender,
-            }
-            path = Api._build_path(
-                ["rooms", room_id, "send", POLL_EVENT_TYPE, str(tx_id)],
-                query_params,
-            )
-            data = Api.to_json(content)
-            resp = await self.client._send(RSR, "PUT", path, data, (room_id,))
-            if isinstance(resp, RSR):
-                return resp.event_id
-            logger.error("Poll (impersonated) fehlgeschlagen: %s", resp)
-            return None
-        else:
-            resp = await self.client.room_send(room_id, POLL_EVENT_TYPE, content)
-            if isinstance(resp, RoomSendResponse):
-                return resp.event_id
-            logger.error("Poll fehlgeschlagen: %s", resp)
+            params["user_id"] = poll_sender
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.put(
+                    url,
+                    params=params,
+                    json=content,
+                    headers={"Content-Type": "application/json"},
+                ) as resp:
+                    data = await resp.json()
+                    if resp.status == 200 and "event_id" in data:
+                        logger.info(
+                            "Poll gesendet als %s – event_id=%s",
+                            poll_sender or self.config.user_id,
+                            data["event_id"],
+                        )
+                        return data["event_id"]
+                    else:
+                        logger.error(
+                            "Poll fehlgeschlagen (HTTP %d): %s",
+                            resp.status, data
+                        )
+                        # Bei M_FORBIDDEN (kein Appservice) → ohne user_id nochmal versuchen
+                        if resp.status == 403 and poll_sender:
+                            logger.warning("Impersonation abgelehnt – sende als Bot")
+                            params.pop("user_id")
+                            async with session.put(
+                                url, params=params, json=content,
+                                headers={"Content-Type": "application/json"},
+                            ) as resp2:
+                                data2 = await resp2.json()
+                                if "event_id" in data2:
+                                    return data2["event_id"]
+                        return None
+        except Exception as exc:
+            logger.exception("Poll HTTP-Fehler: %s", exc)
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
