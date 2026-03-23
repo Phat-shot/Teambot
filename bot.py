@@ -341,13 +341,48 @@ class TeamBot:
             logger.exception("Fehler bei Befehl %s", cmd)
             await self.send(f"❌ Fehler: {exc}", room_id)
 
+    def _resolve_matrix_id(self, sender: str) -> str:
+        """
+        WA-Bridge sendet Responses als @whatsapp_lid-XXX:server.
+        Diese Puppet-IDs auf die echte Matrix-ID zurückführen falls möglich.
+        Bekannte Mappings: poll_sender_id ist die echte ID von Phils WA-Puppet.
+        """
+        if sender.startswith("@whatsapp_"):
+            # Prüfe ob es das Puppet vom poll_sender ist
+            # Die Bridge nutzt fi.mau.double_puppet_source für echte User
+            # Wir mappen einfach alle whatsapp_lid-* auf den poll_sender falls konfiguriert
+            # Bessere Lösung: in DB nachschauen ob ein Spieler mit dieser Matrix-ID existiert
+            pass
+        return sender
+
+    async def _resolve_voter_id(self, sender: str) -> str:
+        """
+        Löst WA-Puppet-IDs auf registrierte Spieler-IDs auf.
+        @whatsapp_lid-XXX → echte Matrix-ID falls Spieler mit dieser Puppet-ID existiert,
+        oder direkt wenn Spieler registriert ist.
+        """
+        # Direkt in DB schauen
+        player = await self.db.get_player(sender)
+        if player:
+            return sender
+
+        # WA-Puppet? Suche Spieler dessen wa_puppet_id passt
+        # Fallback: sender zurückgeben
+        return sender
+
     async def _on_reaction(self, room, event):
         if event.sender == self.config.user_id:
             return
-        if self.config.poll_sender_id and event.sender == self.config.poll_sender_id:
-            return
 
         content = event.source.get("content", {})
+
+        # Poll-Responses immer verarbeiten – auch vom poll_sender
+        # (poll_sender stimmt als normaler User ab, das muss gezählt werden)
+        if event.type in POLL_RESPONSE_TYPES:
+            # Filter nur für m.reaction (nicht für Poll-Responses)
+            pass
+        elif self.config.poll_sender_id and event.sender == self.config.poll_sender_id:
+            return  # Reactions vom poll_sender ignorieren (keine Loop)
 
         # Native Matrix-Poll-Antwort
         if event.type in POLL_RESPONSE_TYPES:
@@ -392,6 +427,7 @@ class TeamBot:
             ).get("answers", [])
             if "yes" in answers:
                 await self.db.upsert_vote_response(vote["id"], event.sender, "yes")
+                await self._handle_yes_voter(event.sender)
             elif "no" in answers:
                 await self.db.upsert_vote_response(vote["id"], event.sender, "no")
             return
@@ -407,10 +443,101 @@ class TeamBot:
         vote = await self.db.get_vote_by_event(target_event_id)
         if not vote or vote["closed"]:
             return
+
+        # Zahlen-Emojis 1️⃣–5️⃣ → Gäste hinzufügen
+        NUMBER_EMOJIS = {"1️⃣": 1, "2️⃣": 2, "3️⃣": 3, "4️⃣": 4, "5️⃣": 5}
+        if key in NUMBER_EMOJIS:
+            count = NUMBER_EMOJIS[key]
+            # Anzeigename des Reagierenden ermitteln
+            room_obj = self.client.rooms.get(self.config.room_id)
+            sender_display = event.sender
+            if room_obj and event.sender in room_obj.users:
+                sender_display = room_obj.users[event.sender].display_name or event.sender
+            await self._add_reaction_guests(event.sender, sender_display, count)
+            return
+
         if key == self.config.vote_yes:
             await self.db.upsert_vote_response(vote["id"], event.sender, "yes")
+            await self._handle_yes_voter(event.sender)
         elif key == self.config.vote_no:
             await self.db.upsert_vote_response(vote["id"], event.sender, "no")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Vote-Helfer: Auto-Registrierung + Gäste per Reaktion
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _handle_yes_voter(self, matrix_id: str):
+        """Prüfe ob Zusagender bereits registriert ist – wenn nicht, anlegen und benachrichtigen."""
+        player = await self.db.get_player(matrix_id)
+        if player:
+            return  # bereits bekannt
+
+        # Anzeigename aus Matrix-Profil holen
+        display_name = matrix_id
+        room_obj = self.client.rooms.get(self.config.room_id)
+        if room_obj and matrix_id in room_obj.users:
+            display_name = room_obj.users[matrix_id].display_name or matrix_id
+
+        # Spieler anlegen: Skill 5, kein GK
+        player_id = await self.db.add_player(matrix_id, display_name, can_gk=False)
+        await self.db.update_field_score(matrix_id, 5.0)
+        logger.info("Neuer Spieler auto-registriert: %s (%s)", display_name, matrix_id)
+
+        # Willkommensnachricht im Hauptraum mit @-Mention
+        await self.send(
+            f"👋 Hi {display_name} ({matrix_id}), schön, dass du mit uns kicken möchtest! "
+            f"Bitte teile uns noch deinen Spielernamen mit und ob du als Torwart in Frage kommst.",
+            self.config.room_id,
+        )
+
+        # Admin-Benachrichtigung
+        if self.config.admin_room_id:
+            await self.send(
+                f"➕ Neuer Spieler automatisch angelegt:\n"
+                f"Name: **{display_name}**\n"
+                f"Matrix-ID: `{matrix_id}`\n"
+                f"Skill: 5.0 | GK: Nein\n"
+                f"(Auto-Registrierung via Poll-Zusage)",
+                self.config.admin_room_id,
+            )
+
+    async def _add_reaction_guests(self, sender: str, sender_display: str, count: int):
+        """Füge Gast-Spieler hinzu basierend auf Zahlen-Reaktion auf den Vote-Poll."""
+        added = []
+        if count == 1:
+            name = f"{sender_display}s Gast"
+            guest = {
+                "id":           f"guest_{sender}_{name.lower().replace(' ', '_')}",
+                "matrix_id":    sender,
+                "display_name": name,
+                "score_field":  5.0,
+                "score_gk":     5.0,
+                "can_gk":       False,
+                "is_guest":     True,
+            }
+            self._guests.append(guest)
+            added.append(name)
+        else:
+            for i in range(1, count + 1):
+                name = f"{sender_display}s Gast {i}"
+                guest = {
+                    "id":           f"guest_{sender}_{i}",
+                    "matrix_id":    sender,
+                    "display_name": name,
+                    "score_field":  5.0,
+                    "score_gk":     5.0,
+                    "can_gk":       False,
+                    "is_guest":     True,
+                }
+                self._guests.append(guest)
+                added.append(name)
+
+        names_str = ", ".join(added)
+        await self.send(
+            f"👤 {count} Gast{'spieler' if count == 1 else 'spieler'} für {sender_display} hinzugefügt: {names_str}",
+            self.config.room_id,
+        )
+        logger.info("Gäste via Reaktion hinzugefügt von %s: %s", sender, names_str)
 
     # ─────────────────────────────────────────────────────────────────────────
     # !player
@@ -1229,7 +1356,7 @@ class TeamBot:
         cfg           = self.config
 
         title = (
-            f"Kicken Morgen, {game_date_str} um "
+            f"Kicken Sonntag, {game_date_str} um "
             f"{cfg.game_hour:02d}:{cfg.game_minute:02d} Uhr"
         )
 
@@ -1244,11 +1371,6 @@ class TeamBot:
             vote_id   = await self.db.create_vote(event_id, vote_date)
             logger.info("Poll gestartet – event_id=%s vote_id=%d", event_id, vote_id)
             self._reset_proposals()
-            await self.send(
-                f"🗳️ Vote gestartet!\n"
-                f"Abstimmen mit ✅ / ❌ im Poll.\n"
-                f"🧤 Als Torwart melden: `!gk` schreiben."
-            )
         else:
             logger.error("Poll konnte nicht gepostet werden")
 
