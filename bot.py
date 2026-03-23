@@ -157,9 +157,15 @@ class TeamBot:
             logger.info("Kein Sync-Token – erster Start, verarbeite nur neue Events")
 
         logger.info("Bot läuft – Sync-Loop startet …")
+
+        # Erster Sync ohne full_state um leere Synapse-Responses zu vermeiden
+        # (nio-Bug: next_batch fehlt bei full_state=True ohne Token)
+        if not since:
+            await self.client.sync(timeout=0)
+            since = self.client.next_batch
+
         await self.client.sync_forever(
             timeout=30_000,
-            full_state=True,
             since=since,
         )
 
