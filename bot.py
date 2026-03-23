@@ -161,7 +161,6 @@ class TeamBot:
             timeout=30_000,
             full_state=True,
             since=since,
-            sync_filter=_build_sync_filter(),
         )
 
     def _setup_scheduler(self):
@@ -1431,24 +1430,6 @@ def _save_sync_token(token: str):
     with open(tmp, "w") as f:
         f.write(token)
     os.replace(tmp, SYNC_TOKEN_PATH)
-
-
-def _build_sync_filter() -> dict:
-    """
-    Sync-Filter: nur Timeline-Events der letzten 7 Tage anfordern.
-    Reduziert Last beim ersten Sync nach längerem Ausfall.
-    """
-    since_ms = int(
-        (datetime.now().timestamp() - MAX_EVENT_AGE_SECONDS) * 1000
-    )
-    return {
-        "room": {
-            "timeline": {
-                "limit": 50,
-                "not_senders": [],
-            }
-        }
-    }
 
 
 def _md_to_html(text: str) -> str:
