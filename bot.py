@@ -279,8 +279,6 @@ class TeamBot:
     async def _on_message(self, room, event):
         if event.sender == self.config.user_id:
             return
-        if self.config.poll_sender_id and event.sender == self.config.poll_sender_id:
-            return
 
         # Events älter als 1 Woche ignorieren (Schutz nach Neustart)
         age_ms = getattr(event, "age", None)
