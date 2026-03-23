@@ -1194,19 +1194,24 @@ class TeamBot:
         poll_sender = self.config.poll_sender
 
         if poll_sender:
-            # Appservice-Impersonation über ?user_id= Query-Parameter
-            # Erlaubt nur für als Appservice registrierte Bots
-            import uuid
-            txn_id = f"poll_{uuid.uuid4().hex}"
-            path = f"/_matrix/client/v3/rooms/{room_id}/send/org.matrix.msc3381.poll.start/{txn_id}"
-            resp = await self.client._send(
-                "PUT",
-                path,
-                content,
-                query_parameters={"user_id": poll_sender},
+            # Appservice-Impersonation: user_id im Query-Parameter
+            # nio's Api._build_path mit zusätzlichem user_id Parameter
+            from uuid import uuid4
+            from nio.api import Api
+            from nio.responses import RoomSendResponse as RSR
+            tx_id = uuid4()
+            query_params = {
+                "access_token": self.client.access_token,
+                "user_id": poll_sender,
+            }
+            path = Api._build_path(
+                ["rooms", room_id, "send", POLL_EVENT_TYPE, str(tx_id)],
+                query_params,
             )
-            if resp and "event_id" in resp:
-                return resp["event_id"]
+            data = Api.to_json(content)
+            resp = await self.client._send(RSR, "PUT", path, data, (room_id,))
+            if isinstance(resp, RSR):
+                return resp.event_id
             logger.error("Poll (impersonated) fehlgeschlagen: %s", resp)
             return None
         else:
