@@ -107,7 +107,6 @@ class TeamBot:
         self.config = config
         self.db = Database(config.db_path)
         self.client = AsyncClient(config.homeserver, config.user_id)
-        self.poll_client: Optional[AsyncClient] = None  # zweiter Client für Poll-Versand
         self.scheduler = AsyncIOScheduler(timezone="Europe/Berlin")
 
         # Aktuell aktive Teams (für Korrekturen und !result)
@@ -142,15 +141,6 @@ class TeamBot:
             raise RuntimeError(f"Matrix-Login fehlgeschlagen: {resp}")
         logger.info("Eingeloggt als %s", self.config.user_id)
 
-        # Zweiter Client für Poll-Versand (WA-Bridge-Workaround)
-        if self.config.poll_sender_id and self.config.poll_sender_password:
-            self.poll_client = AsyncClient(self.config.homeserver, self.config.poll_sender_id)
-            poll_resp = await self.poll_client.login(self.config.poll_sender_password)
-            if isinstance(poll_resp, LoginResponse):
-                logger.info("Poll-Sender eingeloggt als %s", self.config.poll_sender_id)
-            else:
-                logger.warning("Poll-Sender Login fehlgeschlagen: %s – sende Polls als Bot", poll_resp)
-                self.poll_client = None
 
         self.client.add_event_callback(self._on_message, RoomMessageText)
         self.client.add_event_callback(self._on_reaction, UnknownEvent)
@@ -277,8 +267,6 @@ class TeamBot:
     async def _on_message(self, room, event):
         if event.sender == self.config.user_id:
             return
-        if self.config.poll_sender_id and event.sender == self.config.poll_sender_id:
-            return  # Nachrichten vom Poll-Sender ignorieren (keine Dopplung)
 
         # Events älter als 1 Woche ignorieren (Schutz nach Neustart)
         age_ms = getattr(event, "age", None)
@@ -344,8 +332,6 @@ class TeamBot:
     async def _on_reaction(self, room, event):
         if event.sender == self.config.user_id:
             return
-        if self.config.poll_sender_id and event.sender == self.config.poll_sender_id:
-            return  # Reactions/Polls vom Poll-Sender ignorieren
 
         content = event.source.get("content", {})
 
@@ -1204,11 +1190,9 @@ class TeamBot:
             logger.warning("Redact fehlgeschlagen %s: %s", event_id, exc)
 
     async def _post_poll(self, room_id: str, content: dict) -> Optional[str]:
-        """Poll posten – wenn poll_client konfiguriert, über diesen senden (WA-Bridge-Workaround)."""
-        sender = self.poll_client if self.poll_client else self.client
-        resp = await sender.room_send(room_id, POLL_EVENT_TYPE, content)
+        """Poll posten und event_id zurückgeben."""
+        resp = await self.client.room_send(room_id, POLL_EVENT_TYPE, content)
         if isinstance(resp, RoomSendResponse):
-            logger.info("Poll gesendet als %s", sender.user_id)
             return resp.event_id
         logger.error("Poll fehlgeschlagen: %s", resp)
         return None
