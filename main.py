@@ -14,6 +14,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
+# nio.responses wirft harmlose Validation-Warnings bei bestimmten Synapse-Versionen
+logging.getLogger("nio.responses").setLevel(logging.ERROR)
+
 
 def create_config_interactive(path: str):
     """Create config.yml interactively if it doesn't exist."""
