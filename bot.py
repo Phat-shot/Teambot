@@ -440,15 +440,24 @@ class TeamBot:
             return
         target_event_id = relates_to.get("event_id")
         key  = relates_to.get("key", "")
+
+        # 🔃 → Team wechseln – funktioniert unabhängig vom Vote-Poll
+        if key == "🔃":
+            await self._on_team_switch_reaction(room, event)
+            return
+
+        # Ab hier nur auf Vote-Events reagieren
         vote = await self.db.get_vote_by_event(target_event_id)
         if not vote or vote["closed"]:
             return
 
-        # Zahlen-Emojis 1️⃣–5️⃣ → Gäste hinzufügen
-        NUMBER_EMOJIS = {"1️⃣": 1, "2️⃣": 2, "3️⃣": 3, "4️⃣": 4, "5️⃣": 5}
+        # Zahlen-Emojis 1️⃣–9️⃣ → Gäste hinzufügen
+        NUMBER_EMOJIS = {
+            "1️⃣": 1, "2️⃣": 2, "3️⃣": 3, "4️⃣": 4, "5️⃣": 5,
+            "6️⃣": 6, "7️⃣": 7, "8️⃣": 8, "9️⃣": 9,
+        }
         if key in NUMBER_EMOJIS:
             count = NUMBER_EMOJIS[key]
-            # Anzeigename des Reagierenden ermitteln
             room_obj = self.client.rooms.get(self.config.room_id)
             sender_display = event.sender
             if room_obj and event.sender in room_obj.users:
@@ -456,11 +465,72 @@ class TeamBot:
             await self._add_reaction_guests(event.sender, sender_display, count)
             return
 
+        # 🥅 → Als Torwart für diesen Spieltag melden (auch ohne can_gk Flag)
+        if key == "🥅":
+            await self.db.add_gk_request(vote["id"], event.sender)
+            player = await self.db.get_player(event.sender)
+            name = player["display_name"] if player else event.sender
+            await self.send(f"🥅 **{name}** steht als Torwart zur Verfügung!", self.config.room_id)
+            return
+
         if key == self.config.vote_yes:
             await self.db.upsert_vote_response(vote["id"], event.sender, "yes")
             await self._handle_yes_voter(event.sender)
         elif key == self.config.vote_no:
             await self.db.upsert_vote_response(vote["id"], event.sender, "no")
+
+    async def _on_team_switch_reaction(self, room, event):
+        """🔃-Reaktion auf die Team-Nachricht → Spieler wechselt Team mit ähnlichem Gegenspieler."""
+        content  = event.source.get("content", {})
+        relates_to = content.get("m.relates_to", {})
+        if relates_to.get("rel_type") != "m.annotation":
+            return
+        if relates_to.get("key") != "🔃":
+            return
+        if not self._has_active_teams():
+            return
+
+        sender = event.sender
+        # Spieler suchen
+        player = None
+        team   = None
+        for p in self._t1_field:
+            if p.get("matrix_id") == sender:
+                player, team = p, "t1"
+                break
+        for p in self._t2_field:
+            if p.get("matrix_id") == sender:
+                player, team = p, "t2"
+                break
+
+        if not player:
+            return  # Nicht im Team
+
+        own_score = effective_score(player)
+        if team == "t1":
+            candidates = self._t2_field
+            own_list, other_list = self._t1_field, self._t2_field
+        else:
+            candidates = self._t1_field
+            own_list, other_list = self._t2_field, self._t1_field
+
+        if not candidates:
+            return
+
+        # Ähnlichsten Spieler im anderen Team finden
+        best = min(candidates, key=lambda p: abs(effective_score(p) - own_score))
+
+        # Tauschen
+        own_list.remove(player)
+        other_list.remove(best)
+        own_list.append(best)
+        other_list.append(player)
+
+        await self.send(
+            f"🔃 **{player['display_name']}** und **{best['display_name']}** haben die Teams getauscht.\n\n"
+            + self._current_teams_text(),
+            room.room_id,
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Vote-Helfer: Auto-Registrierung + Gäste per Reaktion
