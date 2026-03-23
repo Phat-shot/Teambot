@@ -44,7 +44,10 @@ from nio import (
 
 from config import Config
 from db import Database
-from teams import build_teams, format_teams, effective_score
+from teams import build_teams, format_teams, effective_score, TEAM1_NAME, TEAM2_NAME
+
+TEAM1_LABEL = TEAM1_NAME
+TEAM2_LABEL = TEAM2_NAME
 
 SYNC_TOKEN_PATH = "data/sync_token"
 MAX_EVENT_AGE_SECONDS = 7 * 24 * 3600   # 1 Woche
@@ -60,7 +63,9 @@ HELP_TEXT = """\
 `!match [N]`     – Letzte 5 (oder N) Ergebnisse
 `!gk`            – Als Torwart für dieses Spiel melden
 `!kein_gk`       – GK-Meldung zurückziehen
-`!team`          – Teams aus dem aktuellen Vote generieren
+`!team`          – Neuen Team-Vorschlag generieren (A, B, C, …)
+`!team A`        – Vorschlag A aktivieren
+`!team vote`     – Alle Vorschläge zur Abstimmung stellen
 `!help`          – Diese Hilfe
 
 **Admin – Spieler-Stammdaten** _(Name oder @user:server möglich)_
@@ -73,18 +78,21 @@ HELP_TEXT = """\
 `!player del Name`                   – Spieler deaktivieren
 
 **Admin – Aktuelles Spiel** _(Name oder @user:server möglich)_
-`!match change Name1 Name2`  – Zwei Spieler tauschen
-`!match change Name`         – Spieler ins andere Team verschieben
-`!match gk Name`             – Spieler als Torwart seines Teams setzen
-`!match switched Name`       – Score-Wertung ein-/ausschalten (Toggle)
+`!match guest "Name" [Score]`  – Gastspieler hinzufügen (nur für dieses Spiel)
+`!match change Name1 Name2`    – Zwei Spieler tauschen
+`!match change Name`           – Spieler ins andere Team verschieben
+`!match gk Name`               – Spieler als Torwart seines Teams setzen
+`!match switched Name`         – Score-Wertung ein-/ausschalten (Toggle)
 
 **Admin – Ergebnis & Vote**
 `!result 3:2`  – Ergebnis + Score-Update
 `!vote`        – Vote sofort starten
 
 **Score-System**
-Feldspieler: `field`-Score · GK-fähige Spieler: `0,5 × field + 0,5 × gk`
-Neuberechnung: 50 % Basis · 30 % letzte 5 Spiele · 20 % letztes Spiel
+🟡 Team Gelb  vs  🌈 Team Bunt
+Feldspieler: `field` · GK-fähige Spieler: `0,5 × field + 0,5 × gk`
+Neuberechnung: 50 % letzter Score · 30 % letzte 5 Spiele · 20 % letztes Spiel
+Gäste (👤) erhalten keinen Score-Eintrag.
 
 **Torwart-Zuweisung**
 ① Freiwillige (`!gk`) nach GK-Score
@@ -100,12 +108,22 @@ class TeamBot:
         self.client = AsyncClient(config.homeserver, config.user_id)
         self.scheduler = AsyncIOScheduler(timezone="Europe/Berlin")
 
-        # Aktuell generierte Teams (für Korrekturen und !result)
+        # Aktuell aktive Teams (für Korrekturen und !result)
         self._t1_field:   List[Dict]    = []
         self._t1_gk:      Optional[Dict] = None
         self._t2_field:   List[Dict]    = []
         self._t2_gk:      Optional[Dict] = None
-        self._switched:   set           = set()   # player IDs ohne Wertung
+        self._switched:   set           = set()
+
+        # Gäste – bleiben bis zum nächsten Vote erhalten
+        self._guests:     List[Dict]    = []
+
+        # Team-Vorschläge A, B, C, …
+        self._proposals:         Dict[str, tuple] = {}   # letter → (t1f, gk1, t2f, gk2)
+        self._proposal_players:  frozenset        = frozenset()  # player-IDs des letzten Vorschlagsdurchlaufs
+        self._active_proposal:   Optional[str]    = None
+        self._proposal_poll_id:  Optional[str]    = None   # Matrix event_id des Vorschlags-Polls
+        self._proposal_votes:    Dict[str, int]   = {}     # letter → Stimmenzahl
 
     # ─────────────────────────────────────────────────────────────────────────
     # Start
@@ -156,13 +174,23 @@ class TeamBot:
                         hour=cfg.team_hour, minute=cfg.team_minute),
             id="weekly_teams",
         )
+        # Sonntag 10:00 – meistgewählten Vorschlag aktivieren
+        self.scheduler.add_job(
+            self._scheduled_apply_voted_proposal,
+            CronTrigger(day_of_week=cfg.team_weekday, hour=10, minute=0),
+            id="apply_proposal",
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Hilfsmethoden
     # ─────────────────────────────────────────────────────────────────────────
 
     def _is_admin(self, matrix_id: str) -> bool:
-        return matrix_id in self.config.admin_users
+        """Admin = Mitglied im konfigurierten Admin-Raum."""
+        admin_room = self.client.rooms.get(self.config.admin_room_id)
+        if not admin_room:
+            return False
+        return matrix_id in admin_room.users
 
     async def _resolve_player(self, query: str) -> Optional[Dict]:
         """
@@ -175,28 +203,39 @@ class TeamBot:
         return bool(self._t1_field or self._t1_gk or self._t2_field or self._t2_gk)
 
     def _reset_match_state(self):
+        """Reset Teams nach !result – Gäste bleiben bis zum nächsten Vote."""
         self._t1_field = []
         self._t1_gk    = None
         self._t2_field = []
         self._t2_gk    = None
         self._switched = set()
+        # _guests bleibt erhalten!
+
+    def _reset_proposals(self):
+        """Vorschläge zurücksetzen (neue Spielerliste oder neuer Vote)."""
+        self._proposals        = {}
+        self._proposal_players = frozenset()
+        self._active_proposal  = None
+        self._proposal_poll_id = None
+        self._proposal_votes   = {}
+        self._guests           = []
 
     def _current_teams_text(self) -> str:
         return format_teams(self._t1_field, self._t1_gk, self._t2_field, self._t2_gk)
 
-    async def send(self, text: str) -> Optional[str]:
+    async def send(self, text: str, room_id: Optional[str] = None) -> Optional[str]:
+        """Nachricht senden. Ohne room_id → Hauptraum."""
+        target = room_id or self.config.room_id
         content = {
             "msgtype": "m.text",
             "body": text,
             "format": "org.matrix.custom.html",
             "formatted_body": _md_to_html(text),
         }
-        resp = await self.client.room_send(
-            self.config.room_id, "m.room.message", content
-        )
+        resp = await self.client.room_send(target, "m.room.message", content)
         if isinstance(resp, RoomSendResponse):
             return resp.event_id
-        logger.error("send() fehlgeschlagen: %s", resp)
+        logger.error("send() fehlgeschlagen in %s: %s", target, resp)
         return None
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -222,15 +261,12 @@ class TeamBot:
         _save_sync_token(response.next_batch)
 
     async def _on_message(self, room, event):
-        if room.room_id != self.config.room_id:
-            return
         if event.sender == self.config.user_id:
             return
 
         # Events älter als 1 Woche ignorieren (Schutz nach Neustart)
         age_ms = getattr(event, "age", None)
         if age_ms is None:
-            # server_timestamp ist Unix-ms
             ts = getattr(event, "server_timestamp", 0)
             age_ms = (datetime.now().timestamp() * 1000) - ts
         if age_ms > MAX_EVENT_AGE_SECONDS * 1000:
@@ -241,38 +277,42 @@ class TeamBot:
         if not body.startswith("!"):
             return
 
-        parts = body.split()
-        cmd   = parts[0].lower()
-        args  = parts[1:]
+        parts   = body.split()
+        cmd     = parts[0].lower()
+        args    = parts[1:]
+        room_id = room.room_id   # Antwort immer in den Raum wo der Befehl kam
 
         try:
             match cmd:
                 case "!player":
-                    await self._handle_player(args, event.sender)
+                    await self._handle_player(args, event.sender, room_id)
                 case "!match":
-                    await self._handle_match(args, event.sender)
+                    await self._handle_match(args, event.sender, room_id)
                 case "!result":
-                    await self._handle_result(args, event.sender)
+                    await self._handle_result(args, event.sender, room_id)
                 case "!team":
-                    await self._cmd_team()
+                    if args and args[0].lower() == "vote":
+                        await self._cmd_team(post_vote=True, room_id=room_id)
+                    elif args and len(args[0]) == 1 and args[0].upper().isalpha():
+                        await self._cmd_team(select_letter=args[0], room_id=room_id)
+                    else:
+                        await self._cmd_team(room_id=room_id)
                 case "!vote":
                     if self._is_admin(event.sender):
                         await self._scheduled_vote()
                     else:
-                        await self.send("❌ Keine Berechtigung.")
+                        await self.send("❌ Keine Berechtigung.", room_id)
                 case "!gk":
-                    await self._cmd_gk(event.sender, add=True)
+                    await self._cmd_gk(event.sender, add=True, room_id=room_id)
                 case "!kein_gk":
-                    await self._cmd_gk(event.sender, add=False)
+                    await self._cmd_gk(event.sender, add=False, room_id=room_id)
                 case "!help":
-                    await self.send(HELP_TEXT)
+                    await self.send(HELP_TEXT, room_id)
         except Exception as exc:
             logger.exception("Fehler bei Befehl %s", cmd)
-            await self.send(f"❌ Fehler: {exc}")
+            await self.send(f"❌ Fehler: {exc}", room_id)
 
     async def _on_reaction(self, room, event):
-        if room.room_id != self.config.room_id:
-            return
         if event.sender == self.config.user_id:
             return
 
@@ -282,6 +322,26 @@ class TeamBot:
         if event.type in ("org.matrix.msc3381.poll.response", "m.poll.response"):
             relates_to    = content.get("m.relates_to", {})
             poll_event_id = relates_to.get("event_id")
+
+            # Proposal-Poll?
+            if poll_event_id == self._proposal_poll_id:
+                answers = (
+                    content.get("org.matrix.msc3381.poll.response", {})
+                    or content.get("m.poll.response", {})
+                ).get("answers", [])
+                for letter in answers:
+                    letter = letter.upper()
+                    if letter in self._proposals:
+                        # Nur eine Stimme pro Nutzer – alte rückgängig machen
+                        for l in list(self._proposal_votes):
+                            if self._proposal_votes.get(l + "_voter_" + event.sender):
+                                self._proposal_votes[l] = max(0, self._proposal_votes.get(l, 0) - 1)
+                                del self._proposal_votes[l + "_voter_" + event.sender]
+                        self._proposal_votes[letter] = self._proposal_votes.get(letter, 0) + 1
+                        self._proposal_votes[letter + "_voter_" + event.sender] = 1
+                        logger.info("Proposal vote: %s → %s", event.sender, letter)
+                return
+
             vote = await self.db.get_vote_by_event(poll_event_id)
             if not vote or vote["closed"]:
                 return
@@ -315,7 +375,7 @@ class TeamBot:
     # !player
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def _handle_player(self, args: List[str], sender: str):
+    async def _handle_player(self, args: List[str], sender: str, room_id: Optional[str] = None):
         """
         !player              → Spielerliste (öffentlich)
         !player add …        → Spieler anlegen (Admin)
@@ -324,7 +384,7 @@ class TeamBot:
         !player del …        → Spieler deaktivieren (Admin)
         """
         if not args:
-            return await self._player_list()
+            return await self._player_list(room_id=room_id)
 
         sub = args[0].lower()
 
@@ -333,7 +393,7 @@ class TeamBot:
 
         # ── Schreibende Unterbefehle (Admin) ───────────────────────────────
         if not self._is_admin(sender):
-            return await self.send("❌ Keine Berechtigung.")
+            return await self.send("❌ Keine Berechtigung.", room_id)
 
         if sub == "add":
             # add benötigt immer Matrix-ID (neuer Spieler, Name noch nicht in DB)
@@ -342,16 +402,17 @@ class TeamBot:
                     "Syntax: `!player add @user:server Name [gk]`\n"
                     "`gk` am Ende = Spieler kann Torwart spielen.\n"
                     "Hinweis: `add` benötigt immer die Matrix-ID."
-                )
+                , room_id)
+
             matrix_id = args[1]
             name      = args[2]
             can_gk    = len(args) > 3 and args[3].lower() == "gk"
 
             if await self.db.get_player(matrix_id):
-                return await self.send(f"⚠️ `{matrix_id}` existiert bereits.")
+                return await self.send(f"⚠️ `{matrix_id}` existiert bereits.", room_id)
             await self.db.add_player(matrix_id, name, can_gk)
             hint = " 🧤 (Torwart-fähig)" if can_gk else ""
-            await self.send(f"✅ **{name}** hinzugefügt{hint}.")
+            await self.send(f"✅ **{name}** hinzugefügt{hint}.", room_id)
 
         elif sub == "set":
             # !player set @id|Name 7.5           → field (Standard)
@@ -361,12 +422,14 @@ class TeamBot:
                 return await self.send(
                     "Syntax: `!player set @user:server|Name [field|gk] Wert`\n"
                     "Ohne Typ-Angabe wird immer `field` gesetzt."
-                )
+                , room_id)
+
             if args[2].lower() in ("field", "gk"):
                 if len(args) < 4:
                     return await self.send(
                         "Syntax: `!player set @user:server|Name [field|gk] Wert`"
-                    )
+                    , room_id)
+
                 score_type = args[2].lower()
                 score_str  = args[3]
             else:
@@ -376,53 +439,55 @@ class TeamBot:
             try:
                 score = float(score_str)
             except ValueError:
-                return await self.send("❌ Score muss eine Zahl zwischen 0 und 10 sein.")
+                return await self.send("❌ Score muss eine Zahl zwischen 0 und 10 sein.", room_id)
 
             p = await self._resolve_player(args[1])
             if not p:
-                return await self.send(f"❌ Spieler `{args[1]}` nicht gefunden.")
+                return await self.send(f"❌ Spieler `{args[1]}` nicht gefunden.", room_id)
 
             if score_type == "field":
                 await self.db.update_field_score(p["matrix_id"], score)
-                await self.send(f"✅ **{p['display_name']}** – Feld: **{score:.2f}**")
+                await self.send(f"✅ **{p['display_name']}** – Feld: **{score:.2f}**", room_id)
             else:
                 await self.db.update_gk_score(p["matrix_id"], score)
-                await self.send(f"✅ **{p['display_name']}** – Torwart: **{score:.2f}**")
+                await self.send(f"✅ **{p['display_name']}** – Torwart: **{score:.2f}**", room_id)
 
         elif sub == "gk":
             # !player gk @id oder Name  →  togglet can_gk
             if len(args) < 2:
-                return await self.send("Syntax: `!player gk @user:server` oder `!player gk Name`")
+                return await self.send("Syntax: `!player gk @user:server` oder `!player gk Name`", room_id)
             p = await self._resolve_player(args[1])
             if not p:
-                return await self.send(f"❌ Spieler `{args[1]}` nicht gefunden.")
+                return await self.send(f"❌ Spieler `{args[1]}` nicht gefunden.", room_id)
             new_val = not bool(p.get("can_gk"))
             await self.db.set_can_gk(p["matrix_id"], new_val)
             status = "🧤 aktiviert" if new_val else "⚽ deaktiviert"
             await self.send(
                 f"✅ **{p['display_name']}** – GK-Fähigkeit: **{status}**\n"
                 f"GK-Score bleibt: {p.get('score_gk', 5.0):.2f}"
-            )
+            , room_id)
+
 
         elif sub == "del":
             if len(args) < 2:
-                return await self.send("Syntax: `!player del @user:server` oder `!player del Name`")
+                return await self.send("Syntax: `!player del @user:server` oder `!player del Name`", room_id)
             p = await self._resolve_player(args[1])
             if not p:
-                return await self.send(f"❌ Spieler `{args[1]}` nicht gefunden.")
+                return await self.send(f"❌ Spieler `{args[1]}` nicht gefunden.", room_id)
             await self.db.deactivate_player(p["matrix_id"])
-            await self.send(f"✅ **{p['display_name']}** deaktiviert.")
+            await self.send(f"✅ **{p['display_name']}** deaktiviert.", room_id)
 
         else:
             await self.send(
                 f"❌ Unbekannter Unterbefehl `{sub}`.\n"
                 "Verfügbar: `add`, `set`, `gk`, `del`"
-            )
+            , room_id)
 
-    async def _player_list(self):
+
+    async def _player_list(self, room_id: Optional[str] = None):
         players = await self.db.get_all_players()
         if not players:
-            return await self.send("Noch keine Spieler in der Datenbank.")
+            return await self.send("Noch keine Spieler in der Datenbank.", room_id)
 
         lines = ["**👥 Spieler & Scores**", ""]
         lines.append(f"{'Name':<18} {'Feld':>6}  {'GK':>6}  {'Matrix-ID'}")
@@ -435,13 +500,13 @@ class TeamBot:
                 f"{p.get('score_gk', 5.0):>6.2f}{gk_tag:<3}  "
                 f"`{p['matrix_id']}`"
             )
-        await self.send("\n".join(lines))
+        await self.send("\n".join(lines), room_id)
 
     # ─────────────────────────────────────────────────────────────────────────
     # !match
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def _handle_match(self, args: List[str], sender: str):
+    async def _handle_match(self, args: List[str], sender: str, room_id: Optional[str] = None):
         """
         !match [N]           → letzte 5 / N Ergebnisse (öffentlich)
         !match change …      → Teams anpassen (Admin)
@@ -449,34 +514,37 @@ class TeamBot:
         !match switched …    → Wertung ein/aus (Admin)
         """
         if not args:
-            return await self._match_history(5)
+            return await self._match_history(5, room_id=room_id)
 
         sub = args[0].lower()
 
         # Zahl → letzte N Ergebnisse
         if sub.isdigit():
-            return await self._match_history(int(sub))
+            return await self._match_history(int(sub), room_id=room_id)
 
         # Schreibende Unterbefehle
         if not self._is_admin(sender):
-            return await self.send("❌ Keine Berechtigung.")
+            return await self.send("❌ Keine Berechtigung.", room_id)
 
         if sub == "change":
-            await self._match_change(args[1:])
+            await self._match_change(args[1:], room_id=room_id)
         elif sub == "gk":
-            await self._match_setgk(args[1:])
+            await self._match_setgk(args[1:], room_id=room_id)
         elif sub == "switched":
-            await self._match_switched(args[1:])
+            await self._match_switched(args[1:], room_id=room_id)
+        elif sub == "guest":
+            await self._match_guest(args[1:], room_id=room_id)
         else:
             await self.send(
                 f"❌ Unbekannter Unterbefehl `{sub}`.\n"
                 "Verfügbar: `change`, `gk`, `switched` oder eine Zahl für die Anzahl Ergebnisse."
-            )
+            , room_id)
 
-    async def _match_history(self, n: int):
+
+    async def _match_history(self, n: int, room_id: Optional[str] = None):
         matches = await self.db.get_last_matches(min(n, 50))
         if not matches:
-            return await self.send("📭 Noch keine Ergebnisse gespeichert.")
+            return await self.send("📭 Noch keine Ergebnisse gespeichert.", room_id)
 
         lines = [f"**📋 Letzte {len(matches)} Ergebnisse**", ""]
         for m in matches:
@@ -491,32 +559,107 @@ class TeamBot:
                 result = f"**{s1}:{s2}** 🤝"
             lines.append(f"`{date}`  {result}")
 
-        await self.send("\n".join(lines))
+        await self.send("\n".join(lines), room_id)
 
-    async def _match_change(self, args: List[str]):
+    async def _match_guest(self, args: List[str], room_id: Optional[str] = None):
+        """
+        !match guest "Name" [Score]
+        Fügt einen Gastspieler zur aktuellen Aufstellung hinzu.
+        Ohne Score → Durchschnitt der Teamstärken beider Teams.
+        Gäste werden nach dem Spiel nicht in der Score-DB gespeichert.
+        """
+        if not self._has_teams():
+            return await self.send("❌ Keine Teams vorhanden. Erst `!team` ausführen.", room_id)
+        if not args:
+            return await self.send(
+                'Syntax: `!match guest "Name" [Score]`\n'
+                'Ohne Score → Teamdurchschnitt wird verwendet.'
+            , room_id)
+
+
+        # Name in Anführungszeichen oder einfach erstes Argument
+        raw = " ".join(args)
+        import re as _re
+        m = _re.match(r'^["\'](.+?)["\'](?:\s+([\d.]+))?$', raw)
+        if m:
+            name  = m.group(1)
+            score_str = m.group(2)
+        else:
+            parts = raw.split()
+            name  = parts[0]
+            score_str = parts[1] if len(parts) > 1 else None
+
+        # Score bestimmen
+        if score_str:
+            try:
+                score = round(min(10.0, max(0.0, float(score_str))), 2)
+            except ValueError:
+                return await self.send("❌ Score muss eine Zahl zwischen 0 und 10 sein.", room_id)
+        else:
+            # Durchschnitt aller aktuellen Feldspieler beider Teams
+            all_field = self._t1_field + self._t2_field
+            if all_field:
+                from teams import effective_score as _eff
+                score = round(sum(_eff(p) for p in all_field) / len(all_field), 2)
+            else:
+                score = 5.0
+
+        # Gastspieler als Dict (keine DB-ID, is_guest=True)
+        guest = {
+            "id":           f"guest_{name.lower().replace(' ','_')}",
+            "matrix_id":    None,
+            "display_name": name,
+            "score_field":  score,
+            "score_gk":     score,
+            "score_base":   score,
+            "can_gk":       False,
+            "is_guest":     True,
+            "active":       1,
+        }
+
+        # Ins kleinere Team einfügen (bessere Balance)
+        t1_size = len(self._t1_field) + (1 if self._t1_gk else 0)
+        t2_size = len(self._t2_field) + (1 if self._t2_gk else 0)
+        if t1_size <= t2_size:
+            self._t1_field.append(guest)
+            team_name = TEAM1_LABEL
+        else:
+            self._t2_field.append(guest)
+            team_name = TEAM2_LABEL
+
+        await self.send(
+            f"👤 **{name}** als Gast zu **{team_name}** hinzugefügt "
+            f"(Score: {score:.2f}).\n\n"
+            + self._current_teams_text()
+        , room_id)
+
+
+    async def _match_change(self, args: List[str], room_id: Optional[str] = None):
         """
         !match change Name1 Name2  → tauschen
         !match change Name         → ins andere Team verschieben
         """
         if not self._has_teams():
-            return await self.send("❌ Keine Teams vorhanden. Erst `!team` ausführen.")
+            return await self.send("❌ Keine Teams vorhanden. Erst `!team` ausführen.", room_id)
         if not args:
             return await self.send(
                 "Syntax: `!match change Name` oder `!match change Name1 Name2`"
-            )
+            , room_id)
+
 
         if len(args) >= 2:
             p1, slot1 = self._find_player(args[0])
             p2, slot2 = self._find_player(args[1])
             if not p1:
-                return await self.send(f"❌ **{args[0]}** nicht in den aktuellen Teams.")
+                return await self.send(f"❌ **{args[0]}** nicht in den aktuellen Teams.", room_id)
             if not p2:
-                return await self.send(f"❌ **{args[1]}** nicht in den aktuellen Teams.")
+                return await self.send(f"❌ **{args[1]}** nicht in den aktuellen Teams.", room_id)
             if slot1 == slot2:
                 return await self.send(
                     f"⚠️ **{p1['display_name']}** und **{p2['display_name']}** "
                     "sind bereits im selben Team."
-                )
+                , room_id)
+
             self._remove_from_slot(p1, slot1)
             self._remove_from_slot(p2, slot2)
             self._add_to_slot(p1, slot2)
@@ -524,11 +667,12 @@ class TeamBot:
             await self.send(
                 f"🔄 **{p1['display_name']}** ↔ **{p2['display_name']}** getauscht.\n\n"
                 + self._current_teams_text()
-            )
+            , room_id)
+
         else:
             p, slot = self._find_player(args[0])
             if not p:
-                return await self.send(f"❌ **{args[0]}** nicht in den aktuellen Teams.")
+                return await self.send(f"❌ **{args[0]}** nicht in den aktuellen Teams.", room_id)
 
             target = _opposite_slot(slot)
             self._remove_from_slot(p, slot)
@@ -543,18 +687,19 @@ class TeamBot:
             await self.send(
                 f"➡️ **{p['display_name']}** → **{team_name}**.\n\n"
                 + self._current_teams_text()
-            )
+            , room_id)
 
-    async def _match_setgk(self, args: List[str]):
+
+    async def _match_setgk(self, args: List[str], room_id: Optional[str] = None):
         """!match gk Name → Spieler als Torwart seines Teams setzen."""
         if not self._has_teams():
-            return await self.send("❌ Keine Teams vorhanden. Erst `!team` ausführen.")
+            return await self.send("❌ Keine Teams vorhanden. Erst `!team` ausführen.", room_id)
         if not args:
-            return await self.send("Syntax: `!match gk Name`")
+            return await self.send("Syntax: `!match gk Name`", room_id)
 
         p, slot = self._find_player(args[0])
         if not p:
-            return await self.send(f"❌ **{args[0]}** nicht in den aktuellen Teams.")
+            return await self.send(f"❌ **{args[0]}** nicht in den aktuellen Teams.", room_id)
 
         team = "t1" if "t1" in slot else "t2"
         gk_attr    = f"_{team}_gk"
@@ -571,53 +716,59 @@ class TeamBot:
         await self.send(
             f"🧤 **{p['display_name']}** ist Torwart von **{team_label}**.\n\n"
             + self._current_teams_text()
-        )
+        , room_id)
 
-    async def _match_switched(self, args: List[str]):
+
+    async def _match_switched(self, args: List[str], room_id: Optional[str] = None):
         """!match switched Name → Spieler von Wertung aus-/einschließen."""
         if not self._has_teams():
-            return await self.send("❌ Keine Teams vorhanden. Erst `!team` ausführen.")
+            return await self.send("❌ Keine Teams vorhanden. Erst `!team` ausführen.", room_id)
         if not args:
-            return await self.send("Syntax: `!match switched Name`")
+            return await self.send("Syntax: `!match switched Name`", room_id)
 
         p, slot = self._find_player(args[0])
         if not p:
-            return await self.send(f"❌ **{args[0]}** nicht in den aktuellen Teams.")
+            return await self.send(f"❌ **{args[0]}** nicht in den aktuellen Teams.", room_id)
 
         pid = p["id"]
         if pid in self._switched:
             self._switched.discard(pid)
-            await self.send(f"↩️ **{p['display_name']}** – Wertung wieder aktiv.")
+            await self.send(f"↩️ **{p['display_name']}** – Wertung wieder aktiv.", room_id)
         else:
             self._switched.add(pid)
             await self.send(
                 f"🔕 **{p['display_name']}** – keine Score-Wertung nach dem Spiel."
-            )
+            , room_id)
+
 
     # ─────────────────────────────────────────────────────────────────────────
     # !result
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def _handle_result(self, args: List[str], sender: str):
+    async def _handle_result(self, args: List[str], sender: str, room_id: Optional[str] = None):
         if not self._is_admin(sender):
-            return await self.send("❌ Keine Berechtigung.")
+            return await self.send("❌ Keine Berechtigung.", room_id)
         if not args:
-            return await self.send("Syntax: `!result 3:2`")
+            return await self.send("Syntax: `!result 3:2`", room_id)
         if not self._has_teams():
-            return await self.send("❌ Keine Teams gespeichert. Erst `!team` ausführen.")
+            return await self.send("❌ Keine Teams gespeichert. Erst `!team` ausführen.", room_id)
 
         try:
             s1, s2 = args[0].split(":")
             score1, score2 = int(s1), int(s2)
         except (ValueError, AttributeError):
-            return await self.send("❌ Format: `!result 3:2`")
+            return await self.send("❌ Format: `!result 3:2`", room_id)
 
         all_t1 = self._t1_field + ([self._t1_gk] if self._t1_gk else [])
         all_t2 = self._t2_field + ([self._t2_gk] if self._t2_gk else [])
-        ids1   = [p["id"] for p in all_t1]
-        ids2   = [p["id"] for p in all_t2]
-        gk1_id = self._t1_gk["id"] if self._t1_gk else None
-        gk2_id = self._t2_gk["id"] if self._t2_gk else None
+
+        # Gäste rausfiltern – haben keine echte DB-ID
+        real_t1 = [p for p in all_t1 if not p.get("is_guest")]
+        real_t2 = [p for p in all_t2 if not p.get("is_guest")]
+        ids1    = [p["id"] for p in real_t1]
+        ids2    = [p["id"] for p in real_t2]
+        gk1_id  = self._t1_gk["id"] if self._t1_gk and not self._t1_gk.get("is_guest") else None
+        gk2_id  = self._t2_gk["id"] if self._t2_gk and not self._t2_gk.get("is_guest") else None
 
         await self.db.save_match(score1, score2, ids1, ids2, gk1_id, gk2_id)
 
@@ -627,15 +778,15 @@ class TeamBot:
 
         # Ergebnis-Zeile
         if score1 > score2:
-            result_line = "🏆 **Team 1 gewinnt!**"
+            result_line = f"🏆 **{TEAM1_LABEL} gewinnt!**"
         elif score2 > score1:
-            result_line = "🏆 **Team 2 gewinnt!**"
+            result_line = f"🏆 **{TEAM2_LABEL} gewinnt!**"
         else:
             result_line = "🤝 **Unentschieden!**"
 
         def roster(field, gk):
-            names = ([f"🧤{gk['display_name']}"] if gk else [])
-            names += [p["display_name"] for p in field]
+            names = ([f"🧤{gk['display_name']}" + (" 👤" if gk.get("is_guest") else "")] if gk else [])
+            names += [p["display_name"] + (" 👤" if p.get("is_guest") else "") for p in field]
             return " · ".join(names)
 
         switched_note = ""
@@ -650,11 +801,12 @@ class TeamBot:
 
         await self.send(
             f"⚽ **Spielergebnis**\n\n"
-            f"🔴 Team 1 **{score1}** – {roster(self._t1_field, self._t1_gk)}\n"
-            f"🔵 Team 2 **{score2}** – {roster(self._t2_field, self._t2_gk)}\n\n"
+            f"🟡 {TEAM1_LABEL} **{score1}** – {roster(self._t1_field, self._t1_gk)}\n"
+            f"🌈 {TEAM2_LABEL} **{score2}** – {roster(self._t2_field, self._t2_gk)}\n\n"
             f"{result_line}{switched_note}\n\n"
             f"🔄 Scores aktualisiert."
-        )
+        , room_id)
+
 
         self._reset_match_state()
 
@@ -662,17 +814,48 @@ class TeamBot:
     # !team  /  !gk  /  !kein_gk
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def _cmd_team(self):
+    async def _cmd_team(self, select_letter: Optional[str] = None, post_vote: bool = False, room_id: Optional[str] = None):
+        """
+        !team           → nächsten Vorschlag generieren (oder ersten falls neu)
+        !team A/B/…     → Vorschlag aktivieren
+        !team vote      → alle Vorschläge zur Abstimmung stellen
+        """
+        # ── Vorschlag aktivieren ──────────────────────────────────────────
+        if select_letter:
+            letter = select_letter.upper()
+            if letter not in self._proposals:
+                return await self.send(
+                    f"❌ Vorschlag **{letter}** nicht gefunden.\n"
+                    f"Verfügbar: {', '.join(sorted(self._proposals.keys())) or '–'}"
+                , room_id)
+
+            self._activate_proposal(letter)
+            await self.send(
+                f"✅ **Vorschlag {letter}** ist jetzt aktiv.\n\n"
+                + self._current_teams_text()
+            , room_id)
+
+            return
+
+        # ── Alle Vorschläge zur Abstimmung ────────────────────────────────
+        if post_vote:
+            if not self._proposals:
+                return await self.send("❌ Noch keine Vorschläge. Erst `!team` ausführen.", room_id)
+            await self._post_proposal_poll(room_id=room_id)
+            return
+
+        # ── Neuen Vorschlag generieren ────────────────────────────────────
         vote = await self.db.get_open_vote()
         if not vote:
             return await self.send(
                 "⚠️ Kein offener Vote vorhanden.\n"
                 "Admin kann mit `!vote` einen neuen Vote starten."
-            )
+            , room_id)
+
 
         yes_ids = await self.db.get_vote_yes_players(vote["id"])
         if not yes_ids:
-            return await self.send("⚠️ Noch keine Zusagen im aktuellen Vote.")
+            return await self.send("⚠️ Noch keine Zusagen im aktuellen Vote.", room_id)
 
         players, unknown = [], []
         for mid in yes_ids:
@@ -682,37 +865,75 @@ class TeamBot:
             else:
                 unknown.append(mid)
 
+        # Gäste dazunehmen
+        players += self._guests
+
         if len(players) < 2:
             return await self.send(
-                f"⚠️ Nur {len(players)} bekannte(r) Spieler mit Zusage – mindestens 2 nötig."
-            )
+                f"⚠️ Nur {len(players)} bekannte(r) Spieler – mindestens 2 nötig."
+            , room_id)
+
+
+        # Spielerliste geändert? → Vorschläge zurücksetzen
+        current_ids = frozenset(
+            p.get("id") or p.get("display_name") for p in players
+        )
+        if current_ids != self._proposal_players:
+            self._reset_proposals()
+            self._proposal_players = current_ids
+            # Gäste nach Reset wieder eintragen
+            self._guests = [p for p in players if p.get("is_guest")]
+
+        # Nächsten Buchstaben bestimmen
+        used = sorted(self._proposals.keys())
+        if not used:
+            next_letter = "A"
+        elif used[-1] < "Z":
+            next_letter = chr(ord(used[-1]) + 1)
+        else:
+            return await self.send("⚠️ Alle 26 Vorschläge (A–Z) bereits erstellt.", room_id)
 
         gk_requests = await self.db.get_gk_requests(vote["id"])
-
         t1f, gk1, t2f, gk2 = build_teams(players, gk_requests)
 
-        self._t1_field = t1f
-        self._t1_gk    = gk1
-        self._t2_field = t2f
-        self._t2_gk    = gk2
-        self._switched = set()
+        self._proposals[next_letter] = (t1f, gk1, t2f, gk2)
+        self._activate_proposal(next_letter)
 
-        msg = format_teams(t1f, gk1, t2f, gk2)
+        n_proposals = len(self._proposals)
+        hint = ""
+        if n_proposals > 1:
+            all_letters = ", ".join(f"`!team {l}`" for l in sorted(self._proposals))
+            hint = f"\n\n📋 Alle Vorschläge: {all_letters} · Abstimmung: `!team vote`"
+        elif n_proposals == 1:
+            hint = "\n\nFür einen weiteren Vorschlag nochmal `!team` eingeben."
+
+        msg = f"**Vorschlag {next_letter}**\n\n" + format_teams(t1f, gk1, t2f, gk2) + hint
         if unknown:
             msg += f"\n\n⚠️ Nicht in DB: {', '.join(unknown)}"
-        await self.send(msg)
+        await self.send(msg, room_id)
 
-    async def _cmd_gk(self, sender: str, add: bool):
+    def _activate_proposal(self, letter: str):
+        """Setzt einen Vorschlag als aktive Teams."""
+        t1f, gk1, t2f, gk2 = self._proposals[letter]
+        self._t1_field = list(t1f)
+        self._t1_gk    = gk1
+        self._t2_field = list(t2f)
+        self._t2_gk    = gk2
+        self._switched = set()
+        self._active_proposal = letter
+
+    async def _cmd_gk(self, sender: str, add: bool, room_id: Optional[str] = None):
         vote = await self.db.get_open_vote()
         if not vote:
-            return await self.send("⚠️ Kein offener Vote vorhanden.")
+            return await self.send("⚠️ Kein offener Vote vorhanden.", room_id)
 
         yes_ids = await self.db.get_vote_yes_players(vote["id"])
         if sender not in yes_ids:
             return await self.send(
                 "⚠️ Du hast noch keine Zusage gegeben. "
                 "Erst ✅ im Vote klicken, dann `!gk` schreiben."
-            )
+            , room_id)
+
 
         if add:
             await self.db.add_gk_request(vote["id"], sender)
@@ -722,10 +943,11 @@ class TeamBot:
             await self.send(
                 f"🧤 **{name}** möchte Torwart spielen.\n"
                 f"GK-Freiwillige bisher: {len(gk_list)}"
-            )
+            , room_id)
+
         else:
             await self.db.remove_gk_request(vote["id"], sender)
-            await self.send("👍 GK-Meldung zurückgezogen.")
+            await self.send("👍 GK-Meldung zurückgezogen.", room_id)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Scheduled jobs
@@ -777,6 +999,7 @@ class TeamBot:
             vote_date = game_date.strftime("%Y-%m-%d")
             vote_id   = await self.db.create_vote(resp.event_id, vote_date)
             logger.info("Poll gestartet – event_id=%s vote_id=%d", resp.event_id, vote_id)
+            self._reset_proposals()   # Neue Woche → Vorschläge zurücksetzen
             await self.send(
                 f"🗳️ Vote gestartet!\n"
                 f"Abstimmen mit ✅ / ❌ im Poll.\n"
@@ -787,7 +1010,91 @@ class TeamBot:
 
     async def _scheduled_teams(self):
         logger.info("Automatische Team-Generierung ausgelöst")
-        await self._cmd_team()
+        await self._cmd_team(room_id=room_id)
+
+    async def _scheduled_apply_voted_proposal(self):
+        """Sonntag 10:00 – meistgewählten Vorschlag aktivieren."""
+        if not self._proposal_votes or not self._proposals:
+            logger.info("Kein Proposal-Vote vorhanden – nichts zu tun")
+            return
+
+        # Nur echte Stimmen (keine _voter_ Tracker-Keys)
+        real_votes = {k: v for k, v in self._proposal_votes.items()
+                      if len(k) == 1 and k in self._proposals}
+        if not real_votes:
+            return
+
+        winner = max(real_votes, key=lambda k: real_votes[k])
+        self._activate_proposal(winner)
+        votes_summary = " · ".join(
+            f"{l}: {real_votes.get(l, 0)} Stimme(n)"
+            for l in sorted(self._proposals)
+        )
+        await self.send(
+            f"🗳️ **Abstimmungsergebnis**\n\n"
+            f"{votes_summary}\n\n"
+            f"✅ **Vorschlag {winner}** wurde aktiviert!\n\n"
+            + self._current_teams_text()
+        )
+
+    async def _post_proposal_poll(self, room_id: Optional[str] = None):
+        """Alle Vorschläge als Matrix-Poll zur Abstimmung stellen."""
+        letters = sorted(self._proposals.keys())
+        answers_msc = [
+            {"id": l, "org.matrix.msc3381.poll.answer.text": f"Vorschlag {l}"}
+            for l in letters
+        ]
+        answers_stable = [
+            {"id": l, "m.text": f"Vorschlag {l}"}
+            for l in letters
+        ]
+
+        # Kurze Vorschau pro Option
+        preview_lines = []
+        for l in letters:
+            t1f, gk1, t2f, gk2 = self._proposals[l]
+            gk1_name = f"🧤{gk1['display_name']}" if gk1 else "–"
+            gk2_name = f"🧤{gk2['display_name']}" if gk2 else "–"
+            t1_names = gk1_name + " " + " ".join(p["display_name"] for p in t1f)
+            t2_names = gk2_name + " " + " ".join(p["display_name"] for p in t2f)
+            preview_lines.append(
+                f"**{l}:** 🟡 {t1_names.strip()}  vs  🌈 {t2_names.strip()}"
+            )
+
+        preview = "\n".join(preview_lines)
+        title = "Welche Mannschaftsaufteilung?"
+
+        poll_content = {
+            "msgtype": "m.text",
+            "body": f"🗳️ {title}\n\n{preview}",
+            "org.matrix.msc3381.poll.start": {
+                "kind": "org.matrix.msc3381.poll.disclosed",
+                "max_selections": 1,
+                "question": {"body": f"🗳️ {title}"},
+                "answers": answers_msc,
+            },
+            "m.poll.start": {
+                "kind": "m.poll.disclosed",
+                "max_selections": 1,
+                "question": {"body": f"🗳️ {title}"},
+                "answers": answers_stable,
+            },
+        }
+
+        resp = await self.client.room_send(
+            self.config.room_id, "org.matrix.msc3381.poll.start", poll_content
+        )
+        if isinstance(resp, RoomSendResponse):
+            self._proposal_poll_id = resp.event_id
+            self._proposal_votes   = {}
+            await self.send(
+                f"📋 Vorschläge zur Abstimmung:\n{preview}\n\n"
+                f"Um 10:00 Uhr wird der meistgewählte Vorschlag aktiviert.\n"
+                f"Oder jetzt wählen: `!team A`, `!team B`, …"
+            , room_id)
+
+        else:
+            logger.error("Proposal poll konnte nicht gepostet werden: %s", resp)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Team-Slot-Hilfsmethoden

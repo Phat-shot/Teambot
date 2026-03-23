@@ -5,12 +5,13 @@
 homeserver: "https://matrix.example.org"
 user_id: "@teambot:example.org"
 password: "geheimes-passwort"
-room_id: "!raumid:example.org"
 
-# Admin-Nutzer (dürfen Scores ändern, Ergebnisse eintragen etc.)
-admin_users:
-  - "@admin1:example.org"
-  - "@admin2:example.org"
+# Hauptraum – hier werden Vote, Teams und Ergebnisse gepostet
+room_id: "!hauptraum:example.org"
+
+# Admin-Raum – alle Mitglieder dieses Raumes haben Admin-Rechte
+# Einfach einen privaten Raum erstellen und die gewünschten Admins einladen
+admin_room_id: "!adminraum:example.org"
 
 # Datenbank
 db_path: "data/teambot.db"

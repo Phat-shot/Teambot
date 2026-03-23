@@ -1,7 +1,5 @@
-import os
 import yaml
-from dataclasses import dataclass, field
-from typing import List
+from dataclasses import dataclass
 
 
 @dataclass
@@ -10,8 +8,8 @@ class Config:
     homeserver: str
     user_id: str
     password: str
-    room_id: str
-    admin_users: List[str]
+    room_id: str        # Hauptraum (Announcements + öffentliche Befehle)
+    admin_room_id: str  # Admin-Raum: alle Mitglieder haben Admin-Rechte
 
     # Storage
     db_path: str = "data/teambot.db"
@@ -38,4 +36,6 @@ class Config:
 def load_config(path: str = "config.yml") -> Config:
     with open(path, encoding="utf-8") as f:
         data = yaml.safe_load(f)
+    # Rückwärtskompatibilität: admin_users wird ignoriert falls noch vorhanden
+    data.pop("admin_users", None)
     return Config(**data)
