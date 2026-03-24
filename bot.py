@@ -1640,7 +1640,6 @@ class TeamBot:
                          "6️⃣": 6, "7️⃣": 7, "8️⃣": 8, "9️⃣": 9}
 
         if key == "🔃":
-            # Selektierte Spieler ins andere Team wechseln
             if not players:
                 await self.send("⚠️ Erst Spieler im Poll auswählen, dann reagieren.", self.config.admin_room_id)
                 return
@@ -1648,10 +1647,10 @@ class TeamBot:
                 self._switch_player_team(p)
             names = ", ".join(p["display_name"] for p in players)
             await self.send(f"🔃 Team gewechselt: {names}", self.config.admin_room_id)
+            await self.send(self._current_teams_text(), self.config.room_id)
             await self._post_admin_team_poll()
 
         elif key == "🥅":
-            # Selektierte Spieler als Torwart setzen
             if not players:
                 await self.send("⚠️ Erst Spieler im Poll auswählen, dann reagieren.", self.config.admin_room_id)
                 return
@@ -1659,18 +1658,18 @@ class TeamBot:
                 self._set_player_gk(p)
             names = ", ".join(p["display_name"] for p in players)
             await self.send(f"🥅 Als Torwart gesetzt: {names}", self.config.admin_room_id)
+            await self.send(self._current_teams_text(), self.config.room_id)
             await self._post_admin_team_poll()
 
         elif key in NUMBER_EMOJIS:
-            # Gäste hinzufügen und fair verteilen
             count = NUMBER_EMOJIS[key]
             p = await self.db.get_player(sender)
             sender_display = p["display_name"] if p else sender
             await self._add_guests_balanced(sender, sender_display, count)
+            await self.send(self._current_teams_text(), self.config.room_id)
             await self._post_admin_team_poll()
 
         elif key == "📣":
-            # Team in Hauptgruppe ankündigen
             await self.send(self._current_teams_text(), self.config.room_id)
             await self.send("✅ Team wurde in der Hauptgruppe angekündigt.", self.config.admin_room_id)
 
