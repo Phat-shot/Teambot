@@ -2,6 +2,8 @@
 
 Matrix-Bot für die wöchentliche Fußball-Teamaufstellung. Erstellt automatisch ausgeglichene Teams auf Basis von Spieler-Scores, verwaltet die Torwart-Zuweisung und berechnet Scores nach jedem Spiel neu.
 
+Zwei Räume: ein **Hauptraum** für alle Spieler (Vote, Ankündigungen) und ein **Admin-Raum** für die Teamverwaltung.
+
 ---
 
 ## Features
@@ -9,126 +11,152 @@ Matrix-Bot für die wöchentliche Fußball-Teamaufstellung. Erstellt automatisch
 | Feature | Details |
 |---|---|
 | 🗳️ **Wöchentlicher Vote** | Samstag 12:00 – Bot postet automatisch einen Poll |
-| ✅ **Abstimmung** | Spieler stimmen per nativen Matrix-Poll ab |
-| 🧤 **GK-Meldung** | Spieler melden sich mit `!gk` freiwillig als Torwart |
-| ⚽ **Team-Vorschläge** | Mehrere Vorschläge A/B/C generieren und abstimmen |
+| ✅ **Abstimmung** | Spieler stimmen per nativen Matrix-Poll (auch via WA-Bridge) ab |
+| 🥅 **GK-Meldung** | Mit 🥅-Reaktion auf den Vote-Poll als Torwart melden |
+| 👤 **Gäste** | Mit 1️⃣–9️⃣-Reaktion auf den Vote-Poll Gäste hinzufügen |
+| 🔃 **Team-Tausch** | Mit 🔃-Reaktion ins andere Team wechseln |
+| ⚽ **Team-Vorschläge** | Mehrere Vorschläge A/B/C generieren und per Poll abstimmen |
 | ⚖️ **Score-Balancing** | Teams werden nach effektivem Score optimal ausgeglichen |
+| 🛠️ **Admin-Team-Poll** | Nach `!team` erscheint Poll in Admin-Gruppe zur interaktiven Bearbeitung |
 | 🤖 **Interaktives Menü** | `!cmd` öffnet geführtes Poll-Menü im Admin-Raum |
-| 🌐 **Web-API** | FastAPI-Endpunkte für spätere Weboberfläche vorbereitet |
 
 ---
 
-## Score-System
+## Räume & Berechtigungen
 
-Jeder Spieler hat zwei Scores (0–10, Schrittweite 0,01):
+| Raum | Wer | Was |
+|---|---|---|
+| **Hauptraum** | Alle Spieler | Vote abstimmen, Reaktionen, Ankündigungen empfangen |
+| **Admin-Raum** | Admins | Alle Befehle, Team-Poll, interaktives Menü |
 
-| Score | Beschreibung |
+Im Hauptraum gibt es keine Befehle – alles läuft über Reaktionen auf den Vote-Poll.
+
+---
+
+## Spieler-Aktionen im Hauptraum
+
+Alle Aktionen erfolgen durch **Reaktionen auf den Vote-Poll**:
+
+| Reaktion | Aktion |
 |---|---|
-| `field` | Feldspieler-Stärke |
-| `gk` | Torwart-Qualität (nur für GK-fähige Spieler relevant) |
+| ✅ | Zusage – ich spiele mit |
+| ❌ | Absage |
+| 🥅 | Als Torwart melden (auch ohne GK-Flag) |
+| 1️⃣–9️⃣ | N Gäste hinzufügen (z.B. 2️⃣ → „[User]s Gast 1", „[User]s Gast 2") |
+| 🔃 | _(auf beliebige Nachricht)_ Ins andere Team wechseln – automatischer Tausch mit ähnlich bewertetem Gegenspieler |
 
-**Effektiver Score** für Balancing und Zuweisung:
-- `can_gk = false` → `field`
-- `can_gk = true` → `0,5 × field + 0,5 × gk`
-
-### Score-Neuberechnung nach `!result`
-
-```
-neuer_score = letzter_score × 0,50
-            + Ø_letzte_5_Spiele × 0,30
-            + letztes_Spiel × 0,20
-```
-
-Der **letzte berechnete Score** (nicht der Durchschnitt aller Spiele) ist die Basis. Das führt zu gleichmäßigem Konvergenzverhalten ähnlich einem ELO-System. `field` und `gk` werden getrennt berechnet – nur wenn der Spieler in der jeweiligen Rolle gespielt hat.
-
-**Match-Score** aus Tordifferenz: `clamp(5 + tordifferenz, 0, 10)`
+Wer zum ersten Mal ✅ klickt und noch nicht registriert ist, wird automatisch angelegt (Skill 5, kein GK) und erhält eine Willkommensnachricht.
 
 ---
 
-## Befehle
+## Admin-Team-Poll
 
-### Für alle Nutzer
+Nach jedem `!team`-Aufruf postet der Bot automatisch einen Poll in den **Admin-Raum**. Der Poll listet alle Spieler mit Team-Zugehörigkeit (🟡 / 🌈) als Antworten.
+
+**Ablauf:**
+1. Spieler im Poll auswählen (Multi-Select möglich)
+2. Mit Emoji auf den Poll reagieren:
+
+| Reaktion | Aktion |
+|---|---|
+| 🔃 | Selektierte Spieler ins andere Team wechseln (keine Neuberechnung) |
+| 🥅 | Selektierte Spieler als Torwart setzen (alter TW rückt ins Feld) |
+| 1️⃣–9️⃣ | N Gäste hinzufügen, fair auf beide Teams verteilt |
+| 📣 | Aktuelles Team in Hauptgruppe ankündigen |
+
+Nach jeder Aktion: alter Poll wird gelöscht, neuer Poll wird gepostet. Der Poll bleibt sichtbar bis `!result` eingegeben wird.
+
+---
+
+## Admin-Befehle (nur im Admin-Raum)
+
+### Team & Vote
 
 | Befehl | Beschreibung |
 |---|---|
-| `!player` | Spielerliste mit Scores und Matrix-ID |
-| `!match [N]` | Letzte 5 (oder N) Ergebnisse |
-| `!gk` | Als Torwart für dieses Spiel melden |
-| `!kein_gk` | GK-Meldung zurückziehen |
 | `!team` | Neuen Team-Vorschlag generieren (A, B, C, …) |
 | `!team A` | Vorschlag A aktivieren |
 | `!team vote` | Alle Vorschläge zur Abstimmung stellen |
+| `!vote` | Wöchentlichen Vote sofort starten |
+| `!result 3:2` | Ergebnis eintragen und Scores neu berechnen |
 | `!help` | Alle Befehle anzeigen |
 
-### Admin – Interaktiv (nur im Admin-Raum)
+### Spieler-Stammdaten
 
 | Befehl | Beschreibung |
 |---|---|
-| `!cmd` | Interaktives Menü via Poll starten |
-
-Das Menü führt durch drei Kategorien:
-
-**👤 Spieler** – Spieler anlegen, Scores setzen, GK-Fähigkeit, deaktivieren
-
-**⚽ Spieltag** – Teams generieren, Vorschläge, Gäste, Korrekturen, Ergebnis, Vote
-
-**📊 Auswertung** – Spielerliste, Match-Historie, Scores
-
-Bei Befehlen die einen Namen/Wert benötigen, wird die nächste Nachricht als Eingabe verwendet. Polls werden nach Auswahl automatisch gelöscht.
-
-### Admin – Direkte Befehle
-
-Name oder `@user:server` sind überall möglich.
-
-**Spieler-Stammdaten**
-
-| Befehl | Beschreibung |
-|---|---|
-| `!player add @user:server [Name] [gk]` | Spieler anlegen – ohne Name: Matrix-Anzeigename |
-| `!player set Name 7.5` | Feldspieler-Score setzen (Standard) |
+| `!player` | Spielerliste mit Scores |
+| `!player add @user:server [Name] [gk]` | Spieler anlegen |
+| `!player set Name 7.5` | Feldspieler-Score setzen |
 | `!player set Name field 7.5` | Feldspieler-Score setzen (explizit) |
 | `!player set Name gk 8.0` | Torwart-Score setzen |
-| `!player gk Name` | GK-Fähigkeit ein/aus (Score bleibt erhalten) |
+| `!player gk Name` | GK-Fähigkeit ein/aus (Score bleibt) |
 | `!player del Name` | Spieler deaktivieren |
 
-**Aktuelles Spiel**
+### Spieltag-Korrekturen
 
 | Befehl | Beschreibung |
 |---|---|
-| `!match guest "Name" [Score]` | Gastspieler hinzufügen (kein Score-Update) |
+| `!match [N]` | Letzte 5 (oder N) Ergebnisse |
 | `!match change Name1 [Name2]` | Spieler tauschen oder verschieben |
 | `!match gk Name` | Spieler als Torwart seines Teams setzen |
 | `!match switched Name` | Score-Wertung ein-/ausschalten (Toggle) |
+| `!match guest "Name" [Score]` | Gastspieler manuell hinzufügen |
 
-**Ergebnis & Vote**
+### Interaktives Menü
 
-| Befehl | Beschreibung |
-|---|---|
-| `!result 3:2` | Ergebnis eintragen und Scores neu berechnen |
-| `!vote` | Wöchentlichen Vote sofort starten |
+`!cmd` öffnet ein geführtes Poll-Menü mit drei Kategorien: **👤 Spieler**, **⚽ Spieltag**, **📊 Auswertung**.
 
 ---
 
 ## Wöchentlicher Ablauf
 
 ```
-Samstag 12:00  →  Bot postet Poll "Kicken Morgen, 23.03.2025 um 10:00"
-                   Spieler stimmen mit ✅ / ❌ ab
-                   Wer Torwart spielen möchte: !gk schreiben
+Samstag 12:00  →  Bot postet Poll „Kicken Sonntag, DD.MM.YYYY um 10:00"
+                   ✅ / ❌ abstimmen
+                   🥅-Reaktion = als Torwart melden
+                   1️⃣–9️⃣-Reaktion = Gäste hinzufügen
 
 Sonntag 09:00  →  Bot generiert automatisch Vorschlag A
-                   !team für Vorschlag B, C, …
-                   !team vote → Abstimmung unter allen Vorschlägen
+                   → Admin-Team-Poll erscheint in Admin-Gruppe
+                   Spieler auswählen + 🔃/🥅/1️⃣–9️⃣/📣 reagieren
+                   !team für weitere Vorschläge B, C, …
+                   !team vote → Abstimmung unter Vorschlägen
 
 Sonntag 10:00  →  Meistgewählter Vorschlag wird automatisch aktiviert
-                   (oder manuell: !team A / !team B)
 
-Bei Bedarf     →  Korrekturen mit !match change / !match gk
-                   Gastspieler: !match guest "Name"
+📣-Reaktion      →  Team wird in Hauptgruppe angekündigt
 
 Nach dem Spiel →  Admin: !result 3:2
-                   Bot postet Ergebnis und aktualisiert alle Scores
+                   Bot postet Ergebnis, aktualisiert alle Scores
 ```
+
+---
+
+## Score-System
+
+Jeder Spieler hat zwei Scores (0–10):
+
+| Score | Beschreibung |
+|---|---|
+| `field` | Feldspieler-Stärke |
+| `gk` | Torwart-Qualität |
+
+**Effektiver Score** für Balancing:
+- `can_gk = false` → `field`
+- `can_gk = true` → `0,5 × field + 0,5 × gk`
+
+**Neuberechnung nach `!result`:**
+```
+neuer_score = letzter_score × 0,50
+            + Ø_letzte_5_Spiele × 0,30
+            + letztes_Spiel × 0,20
+```
+
+**Torwart-Zuweisung:**
+① 🥅-Reaktion (Freiwillige, nach GK-Score)
+② GK-fähige Spieler nach GK-Score
+③ Fallback: schwächster Spieler pro Team
 
 ---
 
@@ -143,12 +171,11 @@ cd Teambot
 
 ### 2. Räume anlegen
 
-Zwei Matrix-Räume erstellen – **beide ohne E2E-Verschlüsselung**:
+Zwei Matrix-Räume – **beide ohne E2E-Verschlüsselung**:
+- **Hauptraum** – für alle Spieler
+- **Admin-Raum** – nur für Admins
 
-- **Hauptraum** – für alle Spieler (Vote, Teams, Ergebnisse)
-- **Admin-Raum** – privat, nur für Admins (alle Mitglieder = Admin)
-
-### 3. Konfiguration anlegen
+### 3. Konfiguration
 
 ```bash
 cp config.yml.example config.yml
@@ -162,77 +189,30 @@ nano config.yml
 | `password` | Passwort des Bot-Accounts |
 | `room_id` | Raum-ID des Hauptraums |
 | `admin_room_id` | Raum-ID des Admin-Raums |
+| `poll_sender_id` | Matrix-ID eines WA-Bridge-Users (optional) |
+| `poll_sender_password` | Passwort dieses Users (optional) |
 
-Raum-IDs findest du unter: Raum → Einstellungen → Erweitert → Interne Raum-ID
+`poll_sender_id/password`: Workaround für mautrix-whatsapp – Polls werden über diesen Account gesendet damit die Bridge sie akzeptiert.
 
-### 4. Starten (Docker)
+### 4. Starten
 
 ```bash
-docker compose pull teambot
-docker compose up -d teambot
+docker compose pull teambot && docker compose up -d teambot
 ```
 
 ### 5. Bot einladen
 
 In beiden Räumen: `/invite @teambot:example.org`
 
-Der Bot tritt automatisch bei. Wer im Admin-Raum ist, hat automatisch Admin-Rechte.
-
-### Updates
-
-```bash
-docker compose pull teambot && docker compose up -d teambot
-```
-
----
-
-## Räume & Berechtigungen
-
-| Raum | Wer | Was |
-|---|---|---|
-| Hauptraum | Alle Spieler | Vote abstimmen, `!gk`, `!team`, `!player`, `!match` lesen |
-| Admin-Raum | Admins | `!cmd`, alle schreibenden Befehle, direkte Commands |
-| Beide Räume | Admins | Direkte Commands funktionieren überall |
-
-Announcements (Vote Sa 12:00, Teams So 09:00, Ergebnis) gehen immer in den **Hauptraum**.
-
----
-
-## Web-API (Phase 2)
-
-```bash
-docker compose --profile api up -d
-```
-
-```
-GET http://localhost:8080/players        → Alle aktiven Spieler
-GET http://localhost:8080/players/1      → Einzelspieler
-GET http://localhost:8080/matches/last   → Letztes Match
-GET http://localhost:8080/health         → Status
-```
-
 ---
 
 ## Datenbankstruktur
 
 ```
-players              – Spieler, field/gk-Score, base-Scores, GK-Fähigkeit
-matches              – Matchergebnisse inkl. Torwart-IDs
-match_participations – Score-Protokoll pro Spieler/Match (GK-Flag)
-votes                – Abstimmungsnachrichten (Matrix Event-IDs)
-vote_responses       – Abstimmungs-Antworten der Spieler
-gk_requests          – !gk Meldungen pro Vote
-```
-
-Beim Update wird die Datenbank automatisch migriert. Die Datei liegt unter `data/teambot.db` und wird per Docker-Volume persistiert.
-
----
-
-## Entwicklung
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python main.py          # startet interaktiven Setup-Assistenten wenn keine config.yml
-python test_local.py    # Selbsttest ohne Matrix-Verbindung
+players              – Spieler, field/gk-Score, GK-Fähigkeit
+matches              – Matchergebnisse
+match_participations – Score-Protokoll pro Spieler/Match
+votes                – Vote-Events (Matrix Event-IDs)
+vote_responses       – Abstimmungs-Antworten
+gk_requests          – 🥅-Meldungen pro Vote
 ```

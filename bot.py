@@ -58,37 +58,38 @@ logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 HELP_TEXT = """\
-**⚽ TeamBot – Befehle**
+**⚽ TeamBot – Admin-Befehle** _(nur im Admin-Raum)_
 
-**Für alle**
-`!player`        – Spielerliste mit Scores und Matrix-ID
-`!match [N]`     – Letzte 5 (oder N) Ergebnisse
-`!gk`            – Als Torwart für dieses Spiel melden
-`!kein_gk`       – GK-Meldung zurückziehen
+**Team-Verwaltung**
 `!team`          – Neuen Team-Vorschlag generieren (A, B, C, …)
 `!team A`        – Vorschlag A aktivieren
 `!team vote`     – Alle Vorschläge zur Abstimmung stellen
-`!help`          – Diese Hilfe
+`!vote`          – Vote sofort starten
 
-**Admin – Interaktiv (nur im Admin-Raum)**
-`!cmd`           – Interaktives Menü via Poll starten
-                   Kategorien: Spieler · Spieltag · Auswertung
-
-**Admin – Direkte Befehle** _(Name oder @user:server möglich)_
-`!player add @user:server [gk]`      – Spieler anlegen
+**Spieler-Stammdaten**
+`!player`                            – Spielerliste
+`!player add @user:server [Name] [gk]` – Spieler anlegen
 `!player set Name 7.5`               – Feldspieler-Score setzen
-`!player set Name field 7.5`         – Feldspieler-Score setzen (explizit)
 `!player set Name gk 8.0`            – Torwart-Score setzen
-`!player gk Name`                    – GK-Fähigkeit ein/aus (Score bleibt)
+`!player gk Name`                    – GK-Fähigkeit ein/aus
 `!player del Name`                   – Spieler deaktivieren
 
+**Spieltag-Korrekturen**
 `!match change Name1 [Name2]`        – Spieler tauschen/verschieben
 `!match gk Name`                     – Torwart setzen
 `!match switched Name`               – Score-Wertung ein-/ausschalten
 `!match guest "Name" [Score]`        – Gastspieler hinzufügen
-
 `!result 3:2`                        – Ergebnis + Score-Update
-`!vote`                              – Vote sofort starten
+
+**Interaktives Menü**
+`!cmd`           – Geführtes Poll-Menü starten
+
+**Team-Poll (Admin-Gruppe)**
+Nach `!team` erscheint ein Poll mit allen Spielern.
+Spieler auswählen → mit Emoji reagieren:
+🔃 = Team wechseln  |  🥅 = Als Torwart setzen
+1️⃣–9️⃣ = N Gäste hinzufügen (fair verteilt)
+📣 = Team in Hauptgruppe ankündigen
 
 **Score-System**
 🟡 Team Gelb  vs  🌈 Team Bunt
@@ -96,8 +97,8 @@ Feldspieler: `field` · GK-fähig: `0,5 × field + 0,5 × gk`
 Neuberechnung: 50 % letzter Score · 30 % letzte 5 Spiele · 20 % letztes Spiel
 
 **Torwart-Zuweisung**
-① Freiwillige (`!gk`) nach GK-Score
-② GK-fähige Spieler nach GK-Score  
+① 🥅-Reaktion auf den Vote-Poll (Freiwillige)
+② GK-fähige Spieler nach GK-Score
 ③ Fallback: schwächster Spieler pro Team
 """
 
@@ -126,6 +127,11 @@ class TeamBot:
         self._active_proposal:   Optional[str]    = None
         self._proposal_poll_id:  Optional[str]    = None   # Matrix event_id des Vorschlags-Polls
         self._proposal_votes:    Dict[str, int]   = {}     # letter → Stimmenzahl
+
+        # Admin-Team-Poll (in Admin-Gruppe: Spielerauswahl + Aktions-Emoji)
+        self._admin_team_poll_id:  Optional[str]  = None   # event_id des Admin-Team-Polls
+        self._admin_team_poll_map: Dict[str, Dict] = {}    # answer_id → player dict
+        self._admin_team_selection: Dict[str, List[str]] = {}  # sender → [answer_ids]
 
         # Interaktives Admin-Menü
         self._menu = MenuManager()
@@ -234,7 +240,7 @@ class TeamBot:
         self._active_proposal  = None
         self._proposal_poll_id = None
         self._proposal_votes   = {}
-        self._guests           = []
+        # _guests wird NICHT hier zurückgesetzt – nur bei neuem Vote-Start
 
     def _current_teams_text(self) -> str:
         return format_teams(self._t1_field, self._t1_gk, self._t2_field, self._t2_gk)
@@ -299,10 +305,16 @@ class TeamBot:
         if not body.startswith("!"):
             return
 
-        parts   = body.split()
-        cmd     = parts[0].lower()
-        args    = parts[1:]
-        room_id = room.room_id   # Antwort immer in den Raum wo der Befehl kam
+        parts    = body.split()
+        cmd      = parts[0].lower()
+        args     = parts[1:]
+        room_id  = room.room_id
+        is_admin_room = (room.room_id == self.config.admin_room_id)
+        is_main_room  = (room.room_id == self.config.room_id)
+
+        # Im Hauptraum keine Commands – nur Vote und Announcements
+        if is_main_room:
+            return
 
         try:
             match cmd:
@@ -313,7 +325,7 @@ class TeamBot:
                 case "!result":
                     await self._handle_result(args, event.sender, room_id)
                 case "!cmd":
-                    if room.room_id == self.config.admin_room_id and self._is_admin(event.sender):
+                    if is_admin_room and self._is_admin(event.sender):
                         await self._menu_start(room.room_id, event.sender)
                     elif not self._is_admin(event.sender):
                         await self.send("❌ Keine Berechtigung.", room_id)
@@ -331,10 +343,6 @@ class TeamBot:
                         await self._scheduled_vote()
                     else:
                         await self.send("❌ Keine Berechtigung.", room_id)
-                case "!gk":
-                    await self._cmd_gk(event.sender, add=True, room_id=room_id)
-                case "!kein_gk":
-                    await self._cmd_gk(event.sender, add=False, room_id=room_id)
                 case "!help":
                     await self.send(HELP_TEXT, room_id)
         except Exception as exc:
@@ -416,6 +424,14 @@ class TeamBot:
 
             vote = await self.db.get_vote_by_event(poll_event_id)
             if not vote or vote["closed"]:
+                # Admin-Team-Poll?
+                if poll_event_id == self._admin_team_poll_id:
+                    answers = (
+                        content.get("org.matrix.msc3381.poll.response", {})
+                        or content.get("m.poll.response", {})
+                    ).get("answers", [])
+                    self._admin_team_selection[event.sender] = answers
+                    logger.info("Admin-Poll Auswahl von %s: %s", event.sender, answers)
                 return
             answers = (
                 content.get("org.matrix.msc3381.poll.response", {})
@@ -436,6 +452,13 @@ class TeamBot:
             return
         target_event_id = relates_to.get("event_id")
         key  = relates_to.get("key", "")
+
+        # 🔃/🥅/📣/Zahlen auf Admin-Team-Poll → Admin-Aktionen
+        if (self._admin_team_poll_id and
+                target_event_id == self._admin_team_poll_id and
+                room.room_id == self.config.admin_room_id):
+            await self._handle_admin_team_poll_reaction(room, event)
+            return
 
         # 🔃 → Team wechseln – funktioniert unabhängig vom Vote-Poll
         if key == "🔃":
@@ -1150,6 +1173,10 @@ class TeamBot:
             msg += f"\n\n⚠️ Nicht in DB: {', '.join(unknown)}"
         await self.send(msg, room_id)
 
+        # Admin-Team-Poll in Admin-Gruppe posten
+        if self.config.admin_room_id:
+            await self._post_admin_team_poll()
+
     def _activate_proposal(self, letter: str):
         """Setzt einen Vorschlag als aktive Teams."""
         t1f, gk1, t2f, gk2 = self._proposals[letter]
@@ -1437,6 +1464,7 @@ class TeamBot:
             vote_id   = await self.db.create_vote(event_id, vote_date)
             logger.info("Poll gestartet – event_id=%s vote_id=%d", event_id, vote_id)
             self._reset_proposals()
+            self._guests = []  # Gästeliste bei neuem Vote zurücksetzen
         else:
             logger.error("Poll konnte nicht gepostet werden")
 
@@ -1503,6 +1531,182 @@ class TeamBot:
             , room_id)
         else:
             logger.error("Proposal poll konnte nicht gepostet werden")
+
+    async def _post_admin_team_poll(self):
+        """Aktuelles Team als Poll in der Admin-Gruppe posten. Spieler sind die Antworten."""
+        if not self.config.admin_room_id:
+            return
+        if not self._has_active_teams():
+            return
+
+        # Alten Admin-Poll löschen
+        if self._admin_team_poll_id:
+            await self._redact(self.config.admin_room_id, self._admin_team_poll_id)
+            self._admin_team_poll_id = None
+
+        # Alle Spieler sammeln mit Team-Zuordnung
+        all_players = []
+        for p in self._t1_field:
+            all_players.append((p, "🟡"))
+        if self._t1_gk:
+            all_players.append((self._t1_gk, "🟡🧤"))
+        for p in self._t2_field:
+            all_players.append((p, "🌈"))
+        if self._t2_gk:
+            all_players.append((self._t2_gk, "🌈🧤"))
+
+        # Poll-Antworten: eine pro Spieler
+        answers = []
+        self._admin_team_poll_map = {}
+        for i, (p, team_icon) in enumerate(all_players):
+            aid = f"p{i}"
+            label = f"{team_icon} {p['display_name']}"
+            answers.append((aid, label))
+            self._admin_team_poll_map[aid] = p
+
+        self._admin_team_selection = {}
+
+        poll_content = make_poll(
+            "🏃 Team-Bearbeitung: Spieler auswählen, dann reagieren:\n"
+            "🔃 = Team wechseln  |  🥅 = Torwart  |  1️⃣–9️⃣ = Gäste hinzufügen\n"
+            "📣 = Team in Hauptgruppe ankündigen",
+            answers,
+            max_selections=len(answers),
+        )
+
+        event_id = await self._post_poll(self.config.admin_room_id, poll_content)
+        if event_id:
+            self._admin_team_poll_id = event_id
+            logger.info("Admin-Team-Poll gepostet: %s", event_id)
+
+    async def _handle_admin_team_poll_reaction(self, room, event):
+        """Reaktion auf den Admin-Team-Poll verarbeiten."""
+        if not self.config.admin_room_id:
+            return
+        if room.room_id != self.config.admin_room_id:
+            return
+        if not self._is_admin(event.sender):
+            return
+
+        content = event.source.get("content", {})
+        relates_to = content.get("m.relates_to", {})
+        if relates_to.get("rel_type") != "m.annotation":
+            return
+        if relates_to.get("event_id") != self._admin_team_poll_id:
+            return
+
+        key = relates_to.get("key", "")
+        sender = event.sender
+
+        # Ausgewählte Spieler aus Poll-Responses holen
+        selected = self._admin_team_selection.get(sender, [])
+        players = [self._admin_team_poll_map[aid] for aid in selected if aid in self._admin_team_poll_map]
+
+        NUMBER_EMOJIS = {"1️⃣": 1, "2️⃣": 2, "3️⃣": 3, "4️⃣": 4, "5️⃣": 5,
+                         "6️⃣": 6, "7️⃣": 7, "8️⃣": 8, "9️⃣": 9}
+
+        if key == "🔃":
+            # Selektierte Spieler ins andere Team wechseln
+            if not players:
+                await self.send("⚠️ Erst Spieler im Poll auswählen, dann reagieren.", self.config.admin_room_id)
+                return
+            for p in players:
+                self._switch_player_team(p)
+            names = ", ".join(p["display_name"] for p in players)
+            await self.send(f"🔃 Team gewechselt: {names}", self.config.admin_room_id)
+            await self._post_admin_team_poll()
+
+        elif key == "🥅":
+            # Selektierte Spieler als Torwart setzen
+            if not players:
+                await self.send("⚠️ Erst Spieler im Poll auswählen, dann reagieren.", self.config.admin_room_id)
+                return
+            for p in players:
+                self._set_player_gk(p)
+            names = ", ".join(p["display_name"] for p in players)
+            await self.send(f"🥅 Als Torwart gesetzt: {names}", self.config.admin_room_id)
+            await self._post_admin_team_poll()
+
+        elif key in NUMBER_EMOJIS:
+            # Gäste hinzufügen und fair verteilen
+            count = NUMBER_EMOJIS[key]
+            p = await self.db.get_player(sender)
+            sender_display = p["display_name"] if p else sender
+            await self._add_guests_balanced(sender, sender_display, count)
+            await self._post_admin_team_poll()
+
+        elif key == "📣":
+            # Team in Hauptgruppe ankündigen
+            await self.send(self._current_teams_text(), self.config.room_id)
+            await self.send("✅ Team wurde in der Hauptgruppe angekündigt.", self.config.admin_room_id)
+
+    def _switch_player_team(self, player: Dict):
+        """Spieler ins andere Team wechseln (ohne Neuberechnung)."""
+        if player in self._t1_field:
+            self._t1_field.remove(player)
+            self._t2_field.append(player)
+        elif player in self._t2_field:
+            self._t2_field.remove(player)
+            self._t1_field.append(player)
+        elif self._t1_gk and self._t1_gk["id"] == player["id"]:
+            self._t1_gk = None
+            self._t2_gk = player
+        elif self._t2_gk and self._t2_gk["id"] == player["id"]:
+            self._t2_gk = None
+            self._t1_gk = player
+
+    def _set_player_gk(self, player: Dict):
+        """Spieler als Torwart setzen (ohne Neuberechnung). Tauscht ggf. alten TW ins Feld."""
+        # Spieler aus aktuellem Slot entfernen
+        team = None
+        if player in self._t1_field:
+            self._t1_field.remove(player)
+            team = "t1"
+        elif player in self._t2_field:
+            self._t2_field.remove(player)
+            team = "t2"
+        elif self._t1_gk and self._t1_gk["id"] == player["id"]:
+            return  # Bereits TW Team 1
+        elif self._t2_gk and self._t2_gk["id"] == player["id"]:
+            return  # Bereits TW Team 2
+
+        if team == "t1":
+            if self._t1_gk:
+                self._t1_field.append(self._t1_gk)
+            self._t1_gk = player
+        elif team == "t2":
+            if self._t2_gk:
+                self._t2_field.append(self._t2_gk)
+            self._t2_gk = player
+
+    async def _add_guests_balanced(self, sender: str, sender_display: str, count: int):
+        """Gäste hinzufügen und fair auf beide Teams verteilen."""
+        for i in range(1, count + 1):
+            name = f"{sender_display}s Gast" if count == 1 else f"{sender_display}s Gast {i}"
+            guest = {
+                "id":           f"guest_{sender}_{i}_{len(self._guests)}",
+                "matrix_id":    sender,
+                "display_name": name,
+                "score_field":  5.0,
+                "score_gk":     5.0,
+                "can_gk":       False,
+                "is_guest":     True,
+            }
+            self._guests.append(guest)
+            # Fair verteilen: kleineres Team bekommt den Gast
+            t1_size = len(self._t1_field) + (1 if self._t1_gk else 0)
+            t2_size = len(self._t2_field) + (1 if self._t2_gk else 0)
+            if t1_size <= t2_size:
+                self._t1_field.append(guest)
+            else:
+                self._t2_field.append(guest)
+
+        names = ", ".join(
+            f"{sender_display}s Gast" if count == 1
+            else f"{sender_display}s Gast {i}"
+            for i in range(1, count + 1)
+        )
+        await self.send(f"👤 {count} Gast(spieler) hinzugefügt: {names}", self.config.admin_room_id)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Team-Slot-Hilfsmethoden
