@@ -357,6 +357,51 @@ class TeamBot:
 
         content = event.source.get("content", {})
 
+        # ReactionEvent wird von nio nativ geparst – direkt verarbeiten
+        if isinstance(event, ReactionEvent):
+            target_event_id = event.reacts_to
+            key = event.key
+
+            # Admin-Team-Poll?
+            if (self._admin_team_poll_id and
+                    target_event_id == self._admin_team_poll_id and
+                    room.room_id == self.config.admin_room_id):
+                await self._handle_admin_team_poll_reaction(room, event)
+                return
+
+            # 🔃 → Team wechseln
+            if key == "🔃":
+                await self._on_team_switch_reaction(room, event)
+                return
+
+            # Vote-Reaktionen
+            vote = await self.db.get_vote_by_event(target_event_id)
+            if not vote or vote["closed"]:
+                return
+
+            NUMBER_EMOJIS = {
+                "1️⃣": 1, "2️⃣": 2, "3️⃣": 3, "4️⃣": 4, "5️⃣": 5,
+                "6️⃣": 6, "7️⃣": 7, "8️⃣": 8, "9️⃣": 9,
+            }
+            if key in NUMBER_EMOJIS:
+                count = NUMBER_EMOJIS[key]
+                room_obj = self.client.rooms.get(self.config.room_id)
+                sender_display = event.sender
+                if room_obj and event.sender in room_obj.users:
+                    sender_display = room_obj.users[event.sender].display_name or event.sender
+                await self._add_reaction_guests(event.sender, sender_display, count)
+            elif key == "🥅":
+                await self.db.add_gk_request(vote["id"], event.sender)
+                player = await self.db.get_player(event.sender)
+                name = player["display_name"] if player else event.sender
+                await self.send(f"🥅 **{name}** steht als Torwart zur Verfügung!", self.config.room_id)
+            elif key == self.config.vote_yes:
+                await self.db.upsert_vote_response(vote["id"], event.sender, "yes")
+                await self._handle_yes_voter(event.sender)
+            elif key == self.config.vote_no:
+                await self.db.upsert_vote_response(vote["id"], event.sender, "no")
+            return
+
         # Poll-Responses und Reactions vom poll_sender sind erlaubt –
         # er stimmt ab und reagiert wie jeder andere User.
         # Nur eigene Bot-Events ignorieren (bereits oben gefiltert).
