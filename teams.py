@@ -110,6 +110,7 @@ def format_teams(
     t2_field: List[Dict],
     gk2: Optional[Dict],
 ) -> str:
+    """Vollständiges Format für Admin-Raum (mit Scores)."""
     def gk_line(gk: Optional[Dict]) -> str:
         if not gk:
             return "  🧤 — (kein Torwart)"
@@ -143,4 +144,35 @@ def format_teams(
     all_guests = [p for p in (t1_field + t2_field + [gk1, gk2]) if p and p.get("is_guest")]
     if all_guests:
         lines.append(f"👤 Gäste (kein Score-Update): {', '.join(g['display_name'] for g in all_guests)}")
+    return "\n".join(lines)
+
+
+def format_teams_main(
+    t1_field: List[Dict],
+    gk1: Optional[Dict],
+    t2_field: List[Dict],
+    gk2: Optional[Dict],
+) -> str:
+    """Vereinfachtes Format für Hauptraum – ohne Scores, ohne Stärke, ohne Gast-Hinweis."""
+    def gk_line(gk: Optional[Dict]) -> str:
+        if not gk:
+            return "  🧤 — (kein Torwart)"
+        tag = " 👤" if gk.get("is_guest") else (" ⭐" if gk.get("can_gk") else " (Fallback)")
+        return f"  🧤 {gk['display_name']}{tag}"
+
+    def field_line(p: Dict) -> str:
+        guest = " 👤" if p.get("is_guest") else ""
+        return f"  ⚽ {p['display_name']}{guest}"
+
+    lines = [
+        "⚽ **Mannschaften**",
+        "",
+        f"**{TEAM1_NAME}** 🟡",
+        gk_line(gk1),
+        *[field_line(p) for p in t1_field],
+        "",
+        f"**{TEAM2_NAME}** 🌈",
+        gk_line(gk2),
+        *[field_line(p) for p in t2_field],
+    ]
     return "\n".join(lines)

@@ -47,7 +47,7 @@ from config import Config
 from db import Database
 from menu import MenuManager, category_poll_content, command_poll_content, parse_category_answer, parse_command_answer
 from poll import make_poll, POLL_EVENT_TYPE, POLL_RESPONSE_TYPES, POLL_RESPONSE_KEYS
-from teams import build_teams, format_teams, effective_score, TEAM1_NAME, TEAM2_NAME
+from teams import build_teams, format_teams, format_teams_main, effective_score, TEAM1_NAME, TEAM2_NAME
 
 TEAM1_LABEL = TEAM1_NAME
 TEAM2_LABEL = TEAM2_NAME
@@ -250,6 +250,9 @@ class TeamBot:
     def _current_teams_text(self) -> str:
         return format_teams(self._t1_field, self._t1_gk, self._t2_field, self._t2_gk)
 
+    def _current_teams_text_main(self) -> str:
+        return format_teams_main(self._t1_field, self._t1_gk, self._t2_field, self._t2_gk)
+
     async def send(self, text: str, room_id: Optional[str] = None) -> Optional[str]:
         """Nachricht senden. Ohne room_id → Hauptraum."""
         target = room_id or self.config.room_id
@@ -263,6 +266,21 @@ class TeamBot:
         if isinstance(resp, RoomSendResponse):
             return resp.event_id
         logger.error("send() fehlgeschlagen in %s: %s", target, resp)
+        return None
+
+    async def send_main(self, text: str) -> Optional[str]:
+        """Nachricht in Hauptraum – über poll_client (gebridgter User) falls konfiguriert."""
+        client = self.poll_client if self.poll_client else self.client
+        content = {
+            "msgtype": "m.text",
+            "body": text,
+            "format": "org.matrix.custom.html",
+            "formatted_body": _md_to_html(text),
+        }
+        resp = await client.room_send(self.config.room_id, "m.room.message", content)
+        if isinstance(resp, RoomSendResponse):
+            return resp.event_id
+        logger.error("send_main() fehlgeschlagen: %s", resp)
         return None
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -573,7 +591,7 @@ class TeamBot:
             f"🔃 **{player['display_name']}** ↔ **{best['display_name']}**\n\n"
             + self._current_teams_text()
         )
-        self._last_team_msg_id = await self.send(msg, self.config.room_id)
+        self._last_team_msg_id = await self.send_main(self._current_teams_text_main())
 
         # Admin-Poll auch aktualisieren
         if self.config.admin_room_id:
@@ -1053,7 +1071,13 @@ class TeamBot:
         gk1_id  = self._t1_gk["id"] if self._t1_gk and not self._t1_gk.get("is_guest") else None
         gk2_id  = self._t2_gk["id"] if self._t2_gk and not self._t2_gk.get("is_guest") else None
 
-        await self.db.save_match(score1, score2, ids1, ids2, gk1_id, gk2_id)
+        # Team-Durchschnitte für Elo-Erwartungskorrektur
+        from teams import effective_score as _eff
+        avg1 = sum(_eff(p) for p in all_t1) / len(all_t1) if all_t1 else 5.0
+        avg2 = sum(_eff(p) for p in all_t2) / len(all_t2) if all_t2 else 5.0
+
+        await self.db.save_match(score1, score2, ids1, ids2, gk1_id, gk2_id,
+                                  team1_avg=avg1, team2_avg=avg2)
 
         score_ids = [i for i in (ids1 + ids2) if i not in self._switched]
         await self.db.recalculate_scores(score_ids)
@@ -1081,17 +1105,21 @@ class TeamBot:
             if names:
                 switched_note = f"\n🔕 Ohne Wertung: {', '.join(names)}"
 
-        result_msg = (
+        admin_msg = (
             f"⚽ **Spielergebnis**\n\n"
             f"🟡 {TEAM1_LABEL} **{score1}** – {roster(self._t1_field, self._t1_gk)}\n"
             f"🌈 {TEAM2_LABEL} **{score2}** – {roster(self._t2_field, self._t2_gk)}\n\n"
             f"{result_line}{switched_note}\n\n"
             f"🔄 Scores aktualisiert."
         )
-        await self.send(result_msg, room_id)
-        # Ergebnis auch in Hauptraum ankündigen
+        main_msg = (
+            f"⚽ **Spielergebnis**\n\n"
+            f"**{TEAM1_LABEL}** 🟡 {score1}:{score2} **{TEAM2_LABEL}** 🌈\n\n"
+            f"{result_line}{switched_note}"
+        )
+        await self.send(admin_msg, room_id)
         if room_id != self.config.room_id:
-            await self.send(result_msg, self.config.room_id)
+            await self.send_main(main_msg)
 
 
         self._reset_match_state()
@@ -1200,10 +1228,8 @@ class TeamBot:
 
         # Team auch in Hauptraum ankündigen (ohne Vorschlag-Hinweise)
         if room_id != self.config.room_id:
-            main_msg = f"📋 **Vorgeschlagene Teams:**\n\n" + format_teams(t1f, gk1, t2f, gk2)
-            if unknown:
-                main_msg += f"\n\n⚠️ Nicht in DB: {', '.join(unknown)}"
-            self._last_team_msg_id = await self.send(main_msg, self.config.room_id)
+            main_msg = format_teams_main(t1f, gk1, t2f, gk2)
+            self._last_team_msg_id = await self.send_main(main_msg)
 
         # Admin-Team-Poll in Admin-Gruppe posten
         if self.config.admin_room_id:
@@ -1647,7 +1673,7 @@ class TeamBot:
             await self.send(f"🔃 Team gewechselt: {names}", self.config.admin_room_id)
             if self._last_team_msg_id:
                 await self._redact(self.config.room_id, self._last_team_msg_id)
-            self._last_team_msg_id = await self.send(self._current_teams_text(), self.config.room_id)
+            self._last_team_msg_id = await self.send_main(self._current_teams_text_main())
             await self._post_admin_team_poll()
 
         elif key == "🥅":
@@ -1660,7 +1686,7 @@ class TeamBot:
             await self.send(f"🥅 Als Torwart gesetzt: {names}", self.config.admin_room_id)
             if self._last_team_msg_id:
                 await self._redact(self.config.room_id, self._last_team_msg_id)
-            self._last_team_msg_id = await self.send(self._current_teams_text(), self.config.room_id)
+            self._last_team_msg_id = await self.send_main(self._current_teams_text_main())
             await self._post_admin_team_poll()
 
         elif key in NUMBER_EMOJIS:
@@ -1670,13 +1696,13 @@ class TeamBot:
             await self._add_guests_balanced(sender, sender_display, count)
             if self._last_team_msg_id:
                 await self._redact(self.config.room_id, self._last_team_msg_id)
-            self._last_team_msg_id = await self.send(self._current_teams_text(), self.config.room_id)
+            self._last_team_msg_id = await self.send_main(self._current_teams_text_main())
             await self._post_admin_team_poll()
 
         elif key == "📣":
             if self._last_team_msg_id:
                 await self._redact(self.config.room_id, self._last_team_msg_id)
-            self._last_team_msg_id = await self.send(self._current_teams_text(), self.config.room_id)
+            self._last_team_msg_id = await self.send_main(self._current_teams_text_main())
             await self.send("✅ Team wurde in der Hauptgruppe angekündigt.", self.config.admin_room_id)
 
     def _switch_player_team(self, player: Dict):
