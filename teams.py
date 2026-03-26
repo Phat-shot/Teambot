@@ -131,11 +131,11 @@ def format_teams(
     lines = [
         "⚽ **Mannschaften** ⚽",
         "",
-        f"🟡 **{TEAM1_NAME}**  |  Stärke: {t1_total:.2f}",
+        f"**{TEAM1_NAME}**  |  Stärke: {t1_total:.2f}",
         gk_line(gk1),
         *[field_line(p) for p in t1_field],
         "",
-        f"🌈 **{TEAM2_NAME}**  |  Stärke: {t2_total:.2f}",
+        f"**{TEAM2_NAME}**  |  Stärke: {t2_total:.2f}",
         gk_line(gk2),
         *[field_line(p) for p in t2_field],
         "",
@@ -167,11 +167,11 @@ def format_teams_main(
     lines = [
         "⚽ **Mannschaften**",
         "",
-        f"**{TEAM1_NAME}** 🟡",
+        f"**{TEAM1_NAME}**",
         gk_line(gk1),
         *[field_line(p) for p in t1_field],
         "",
-        f"**{TEAM2_NAME}** 🌈",
+        f"**{TEAM2_NAME}**",
         gk_line(gk2),
         *[field_line(p) for p in t2_field],
     ]

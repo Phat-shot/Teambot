@@ -415,7 +415,7 @@ class TeamBot:
                 await self.db.add_gk_request(vote["id"], event.sender)
                 player = await self.db.get_player(event.sender)
                 name = player["display_name"] if player else event.sender
-                await self.send(f"🥅 **{name}** steht als Torwart zur Verfügung!", self.config.room_id)
+                await self.send(f"🥅 **{name}** steht als Torwart zur Verfügung!", self.config.admin_room_id or self.config.room_id)
             elif key == self.config.vote_yes:
                 await self.db.upsert_vote_response(vote["id"], event.sender, "yes")
                 await self._handle_yes_voter(event.sender)
@@ -533,7 +533,7 @@ class TeamBot:
             await self.db.add_gk_request(vote["id"], event.sender)
             player = await self.db.get_player(event.sender)
             name = player["display_name"] if player else event.sender
-            await self.send(f"🥅 **{name}** steht als Torwart zur Verfügung!", self.config.room_id)
+            await self.send(f"🥅 **{name}** steht als Torwart zur Verfügung!", self.config.admin_room_id or self.config.room_id)
             return
 
         if key == self.config.vote_yes:
@@ -618,21 +618,14 @@ class TeamBot:
         await self.db.update_score(matrix_id, 5.0)
         logger.info("Neuer Spieler auto-registriert: %s (%s)", display_name, matrix_id)
 
-        # Willkommensnachricht im Hauptraum mit @-Mention
-        await self.send(
-            f"👋 Hi {display_name} ({matrix_id}), schön, dass du mit uns kicken möchtest! "
-            f"Bitte teile uns noch deinen Spielernamen mit und ob du als Torwart in Frage kommst.",
-            self.config.room_id,
-        )
-
         # Admin-Benachrichtigung
         if self.config.admin_room_id:
             await self.send(
                 f"➕ Neuer Spieler automatisch angelegt:\n"
                 f"Name: **{display_name}**\n"
                 f"Matrix-ID: `{matrix_id}`\n"
-                f"Skill: 5.0 | GK: Nein\n"
-                f"(Auto-Registrierung via Poll-Zusage)",
+                f"Score: 5.0 | GK: Nein\n"
+                f"👋 Willkommensnachricht direkt an Spieler empfohlen.",
                 self.config.admin_room_id,
             )
 
@@ -670,7 +663,7 @@ class TeamBot:
         names_str = ", ".join(added)
         await self.send(
             f"👤 {count} Gast{'spieler' if count == 1 else 'spieler'} für {sender_display} hinzugefügt: {names_str}",
-            self.config.room_id,
+            self.config.admin_room_id or self.config.room_id,
         )
         logger.info("Gäste via Reaktion hinzugefügt von %s: %s", sender, names_str)
 
