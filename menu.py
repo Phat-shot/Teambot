@@ -90,9 +90,25 @@ def player_menu_poll() -> dict:
     )
 
 
-def player_select_poll(players: list, action_label: str) -> dict:
-    answers = [(f"ps_{p['id']}", p["display_name"]) for p in players]
-    return make_poll(f"👤 Spieler auswählen – {action_label}", _with_back(answers))
+def player_select_poll(players: list, action_label: str, page: int = 0) -> dict:
+    """Poll mit registrierten Spielern, max 16 pro Seite."""
+    PAGE_SIZE = 16
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    page_players = players[start:end]
+    answers = [(f"ps_{p['id']}", f"#{p.get('player_number','?')} {p['display_name']}") for p in page_players]
+    nav = []
+    if page > 0:
+        nav.append((f"page_{page - 1}", "⬅️ Vorherige Seite"))
+    if end < len(players):
+        nav.append((f"page_{page + 1}", "➡️ Nächste Seite"))
+    nav.append(("back", "↩️ Abbrechen"))
+    total = len(players)
+    title = (
+        f"👤 {action_label} (Seite {page + 1}/{(total - 1) // PAGE_SIZE + 1})"
+        if total > PAGE_SIZE else f"👤 Spieler auswählen – {action_label}"
+    )
+    return make_poll(title, answers + nav)
 
 
 def room_members_poll(members: list, page: int = 0) -> dict:

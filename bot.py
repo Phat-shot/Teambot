@@ -346,6 +346,8 @@ class TeamBot:
             match cmd:
                 case "!player":
                     await self._handle_player(args, event.sender, room_id)
+                case "!name":
+                    await self._handle_name(args, event.sender, room_id)
                 case "!match":
                     await self._handle_match(args, event.sender, room_id)
                 case "!result":
@@ -783,19 +785,37 @@ class TeamBot:
             , room_id)
 
 
+    async def _handle_name(self, args: List[str], sender: str, room_id: Optional[str] = None):
+        """!name [ID] Neuer Name  – Spieler umbenennen über interne Nummer."""
+        if not self._is_admin(sender):
+            return await self.send("❌ Keine Berechtigung.", room_id)
+        if len(args) < 2:
+            return await self.send("Syntax: `!name 0042 Neuer Name`", room_id)
+        number = args[0].lstrip("#")
+        new_name = " ".join(args[1:]).strip()
+        if not new_name:
+            return await self.send("❌ Kein Name angegeben.", room_id)
+        p = await self.db.get_player_by_number(number)
+        if not p:
+            return await self.send(f"❌ Spieler `#{number}` nicht gefunden.", room_id)
+        old_name = p["display_name"]
+        await self.db.rename_player(p["matrix_id"], new_name)
+        await self.send(f"✅ **{old_name}** → **{new_name}** (`#{p['player_number']}`)", room_id)
+
     async def _player_list(self, room_id: Optional[str] = None):
         players = await self.db.get_all_players()
         if not players:
             return await self.send("Noch keine Spieler in der Datenbank.", room_id)
 
         lines = ["**👥 Spieler & Scores**", ""]
-        lines.append(f"{'Name':<18} {'Score':>6}  {'Matrix-ID'}")
-        lines.append("─" * 50)
+        lines.append(f"{'#':<6} {'Name':<18} {'Score':>6}  {'Matrix-ID'}")
+        lines.append("─" * 56)
         for p in players:
             gk_tag = " 🥅" if p.get("can_gk") else ""
             score = p.get("score", p.get("score_field", 5.0))
+            num = p.get("player_number") or "—"
             lines.append(
-                f"{p['display_name']:<18} "
+                f"{num:<6} {p['display_name']:<18} "
                 f"{score:>6.2f}{gk_tag:<3}  "
                 f"`{p['matrix_id']}`"
             )
@@ -1389,6 +1409,18 @@ class TeamBot:
                 if pid: state.poll_event_ids.append(pid)
 
         # ── Level 2: Spieler-Select-Flows ─────────────────────────────────
+        elif state.command in ("player_add_select", "player_edit_select", "player_del_select",
+                               "player_set_score") and answer.startswith("page_"):
+            page = int(answer[5:])
+            if state.command == "player_add_select":
+                members = getattr(state, "_members", [])
+                pid = await self._post_poll(room_id, room_members_poll(members, page))
+            else:
+                players = getattr(state, "_players", [])
+                label = "Score ändern" if state.command == "player_edit_select" else "Löschen"
+                pid = await self._post_poll(room_id, player_select_poll(players, label, page))
+            if pid: state.poll_event_ids.append(pid)
+
         elif state.command == "player_add_select" and answer.startswith("rm_"):
             idx = int(answer[3:])
             members = getattr(state, "_members", [])
@@ -1569,14 +1601,10 @@ class TeamBot:
             await self._redact(room_id, state.prompt_msg_id)
 
     async def _redact(self, room_id: str, event_id: str):
-        """Nachricht löschen. Im Admin-Raum → Bot (hat Power Level), im Hauptraum → poll_client."""
-        if room_id == self.config.room_id and self.poll_client:
-            clients = [self.poll_client, self.client]
-        else:
-            clients = [self.client, self.poll_client]
-        for client in filter(None, clients):
+        """Nachricht löschen. Versucht beide Clients – Poll-Client zuerst (postet meistens)."""
+        from nio import RoomRedactResponse
+        for client in filter(None, [self.poll_client, self.client]):
             try:
-                from nio import RoomRedactResponse
                 resp = await client.room_redact(room_id, event_id, reason="Menü-Auswahl")
                 if isinstance(resp, RoomRedactResponse):
                     return
