@@ -1333,8 +1333,9 @@ class TeamBot:
         elif state.category == "player" and state.level == 2 and answer in ("pl_add", "pl_edit", "pl_del"):
             if answer == "pl_add":
                 state.command = "player_add_select"
-                # Hauptraum scannen (nicht Admin-Raum)
-                room_obj = self.client.rooms.get(self.config.room_id)
+                # Hauptraum über poll_client scannen (Phil ist Mitglied, Teambot evtl. nicht)
+                scan_client = self.poll_client if self.poll_client else self.client
+                room_obj = scan_client.rooms.get(self.config.room_id)
                 all_players = await self.db.get_all_players(active_only=False)
                 active_ids   = {p["matrix_id"] for p in all_players if p["active"]}
                 inactive     = [p for p in all_players if not p["active"]]
@@ -1562,15 +1563,20 @@ class TeamBot:
             await self._redact(room_id, state.prompt_msg_id)
 
     async def _redact(self, room_id: str, event_id: str):
-        """Matrix-Nachricht löschen. Versucht erst poll_client (für Polls), dann Bot."""
-        for client in filter(None, [self.poll_client, self.client]):
+        """Nachricht löschen. Im Admin-Raum → Bot (hat Power Level), im Hauptraum → poll_client."""
+        if room_id == self.config.room_id and self.poll_client:
+            clients = [self.poll_client, self.client]
+        else:
+            clients = [self.client, self.poll_client]
+        for client in filter(None, clients):
             try:
+                from nio import RoomRedactResponse
                 resp = await client.room_redact(room_id, event_id, reason="Menü-Auswahl")
-                if not isinstance(resp, Exception):
+                if isinstance(resp, RoomRedactResponse):
                     return
             except Exception:
                 pass
-        logger.warning("Redact fehlgeschlagen für %s", event_id)
+        logger.warning("Redact fehlgeschlagen für %s in %s", event_id, room_id)
 
     async def _post_poll(self, room_id: str, content: dict) -> Optional[str]:
         """Poll posten – über poll_client falls konfiguriert, sonst Bot."""
