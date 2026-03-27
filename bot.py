@@ -1310,11 +1310,11 @@ class TeamBot:
                 if pid: state.poll_event_ids.append(pid)
 
         # ── Level 2: Spieler-Untermenü ────────────────────────────────────
-        elif state.category == "player" and state.level == 2:
+        elif state.category == "player" and state.level == 2 and answer in ("pl_add", "pl_edit", "pl_del"):
             if answer == "pl_add":
-                state.command = "player_add"
-                # Raum-Mitglieder holen die noch nicht registriert sind
-                room_obj = self.client.rooms.get(room_id)
+                state.command = "player_add_select"
+                # Hauptraum scannen (nicht Admin-Raum)
+                room_obj = self.client.rooms.get(self.config.room_id)
                 all_players = await self.db.get_all_players(active_only=False)
                 known_ids = {p["matrix_id"] for p in all_players}
                 members = []
@@ -1326,11 +1326,9 @@ class TeamBot:
                             name = user.display_name or mid.split(":")[0].lstrip("@")
                             members.append((mid, name))
                 if members:
-                    state.level = 2
                     state._members = members  # type: ignore
                     pid = await self._post_poll(room_id, room_members_poll(members))
                     if pid: state.poll_event_ids.append(pid)
-                    state.command = "player_add_select"
                 else:
                     await self.send("✅ Alle Raum-Mitglieder sind bereits angelegt.", room_id)
                     self._menu.clear(room_id)
@@ -1343,7 +1341,6 @@ class TeamBot:
                     self._menu.clear(room_id)
                     return
                 state._players = players  # type: ignore
-                state.level = 2
                 pid = await self._post_poll(room_id, player_select_poll(players, "Score ändern"))
                 if pid: state.poll_event_ids.append(pid)
 
@@ -1355,7 +1352,6 @@ class TeamBot:
                     self._menu.clear(room_id)
                     return
                 state._players = players  # type: ignore
-                state.level = 2
                 pid = await self._post_poll(room_id, player_select_poll(players, "Löschen"))
                 if pid: state.poll_event_ids.append(pid)
 
@@ -1377,10 +1373,8 @@ class TeamBot:
             if p:
                 state.selected_matrix_id = p["matrix_id"]
                 state.command = "player_set_score"
-                state.level = 2
                 pid = await self._post_poll(room_id, score_poll())
                 if pid: state.poll_event_ids.append(pid)
-                await self.send(f"📊 Score für **{p['display_name']}** wählen:", room_id)
             else:
                 self._menu.clear(room_id)
 
@@ -1401,6 +1395,8 @@ class TeamBot:
             if p:
                 await self.db.deactivate_player(p["matrix_id"])
                 await self.send(f"✅ **{p['display_name']}** deaktiviert.", room_id)
+            else:
+                await self.send("⚠️ Spieler nicht gefunden.", room_id)
             self._menu.clear(room_id)
 
         # ── Level 2: Matchday-Untermenü ───────────────────────────────────
