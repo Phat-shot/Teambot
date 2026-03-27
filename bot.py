@@ -1288,6 +1288,26 @@ class TeamBot:
         await self._redact(room_id, poll_event_id)
         state.poll_event_ids = [e for e in state.poll_event_ids if e != poll_event_id]
 
+        # ── Zurück ────────────────────────────────────────────────────────
+        if answer == "back":
+            if state.category and state.command in (
+                "player_add_select", "player_edit_select", "player_del_select", "player_set_score"
+            ):
+                # Zurück zum Spieler-Untermenü
+                state.command = ""
+                pid = await self._post_poll(room_id, player_menu_poll())
+                if pid: state.poll_event_ids.append(pid)
+            elif state.category:
+                # Zurück zum Hauptmenü
+                state.category = ""
+                state.command = ""
+                state.level = 1
+                pid = await self._post_poll(room_id, main_menu_poll())
+                if pid: state.poll_event_ids.append(pid)
+            else:
+                self._menu.clear(room_id)
+            return
+
         # ── Level 1: Hauptkategorie ───────────────────────────────────────
         if state.level == 1:
             if answer == "cat_player":
@@ -1333,9 +1353,7 @@ class TeamBot:
                     members.append((p["matrix_id"], f"↩️ {p['display_name']} (reaktivieren)", True))
                 if members:
                     state._members = members  # type: ignore
-                    answers = [(f"rm_{i}", name) for i, (_, name, _) in enumerate(members)]
-                    from poll import make_poll as _mp
-                    pid = await self._post_poll(room_id, _mp("➕ Wen hinzufügen / reaktivieren?", answers, max_selections=len(answers)))
+                    pid = await self._post_poll(room_id, room_members_poll(members))
                     if pid: state.poll_event_ids.append(pid)
                 else:
                     await self.send("✅ Alle Raum-Mitglieder sind bereits angelegt.", room_id)

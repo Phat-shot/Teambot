@@ -67,6 +67,11 @@ class MenuManager:
 # Poll-Content Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _with_back(answers: list) -> list:
+    """Fügt ↩️ Zurück als letzte Option hinzu."""
+    return answers + [("back", "↩️ Zurück")]
+
+
 def main_menu_poll() -> dict:
     return make_poll(
         "🤖 TeamBot – Was möchtest du tun?",
@@ -77,64 +82,61 @@ def main_menu_poll() -> dict:
 def player_menu_poll() -> dict:
     return make_poll(
         "👤 Spieler – Was möchtest du tun?",
-        [
+        _with_back([
             ("pl_add",  "➕ Hinzufügen"),
             ("pl_edit", "✏️ Score ändern"),
             ("pl_del",  "❌ Löschen"),
-        ],
+        ]),
     )
 
 
 def player_select_poll(players: list, action_label: str) -> dict:
-    """Poll mit allen registrierten Spielern zur Auswahl."""
     answers = [(f"ps_{p['id']}", p["display_name"]) for p in players]
-    return make_poll(f"👤 Spieler auswählen – {action_label}", answers)
+    return make_poll(f"👤 Spieler auswählen – {action_label}", _with_back(answers))
 
 
 def room_members_poll(members: list) -> dict:
-    """Poll mit Raum-Mitgliedern die noch nicht angelegt sind."""
-    answers = [(f"rm_{i}", f"{name} ({mid})") for i, (mid, name) in enumerate(members)]
-    return make_poll("➕ Wen hinzufügen?", answers, max_selections=len(answers))
+    answers = [(f"rm_{i}", f"{name} ({mid})") for i, (mid, name, _) in enumerate(members)]
+    return make_poll("➕ Wen hinzufügen?", _with_back(answers), max_selections=len(answers) + 1)
 
 
 def score_poll() -> dict:
-    """Poll mit Score-Werten 0–10 in 0.5-Schritten."""
     scores = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,
               5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0]
     answers = [(f"sc_{int(s*10)}", str(s)) for s in scores]
-    return make_poll("📊 Score vergeben (0–10):", answers)
+    return make_poll("📊 Score vergeben (0–10):", _with_back(answers))
 
 
 def matchday_menu_poll(vote_open: bool) -> dict:
     if vote_open:
         return make_poll(
             "📅 Matchday – Vote ist offen:",
-            [
+            _with_back([
                 ("md_team",   "⚽ Team erstellen"),
                 ("md_result", "📝 Ergebnis eintragen"),
-            ],
+            ]),
         )
     else:
         return make_poll(
             "📅 Matchday – Kein Vote offen:",
-            [
+            _with_back([
                 ("md_vote",   "🗓️ Vote starten"),
                 ("md_result", "📝 Ergebnis eintragen"),
-            ],
+            ]),
         )
 
 
 def team_menu_poll() -> dict:
     return make_poll(
         "⚽ Team – Was möchtest du tun?",
-        [
-            ("tm_next",   "🎲 Team-Vorschlag generieren"),
-            ("tm_alt",    "🔀 Weiteren Vorschlag"),
-            ("tm_select", "✅ Vorschlag aktivieren"),
-            ("tm_guest",  "👤 Gast hinzufügen"),
-            ("tm_change", "🔄 Spieler tauschen"),
-            ("tm_gk",     "🧤 Torwart setzen"),
-            ("tm_switch", "🔕 Spieler nicht werten"),
+        _with_back([
+            ("tm_next",    "🎲 Team-Vorschlag generieren"),
+            ("tm_alt",     "🔀 Weiteren Vorschlag"),
+            ("tm_select",  "✅ Vorschlag aktivieren"),
+            ("tm_guest",   "👤 Gast hinzufügen"),
+            ("tm_change",  "🔄 Spieler tauschen"),
+            ("tm_gk",      "🧤 Torwart setzen"),
+            ("tm_switch",  "🔕 Spieler nicht werten"),
             ("tm_announce","📣 Team ankündigen"),
-        ],
+        ]),
     )
