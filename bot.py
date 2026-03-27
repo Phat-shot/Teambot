@@ -1333,22 +1333,27 @@ class TeamBot:
         elif state.category == "player" and state.level == 2 and answer in ("pl_add", "pl_edit", "pl_del"):
             if answer == "pl_add":
                 state.command = "player_add_select"
-                # Hauptraum über poll_client scannen (Phil ist Mitglied, Teambot evtl. nicht)
                 scan_client = self.poll_client if self.poll_client else self.client
-                room_obj = scan_client.rooms.get(self.config.room_id)
                 all_players = await self.db.get_all_players(active_only=False)
                 active_ids   = {p["matrix_id"] for p in all_players if p["active"]}
                 inactive     = [p for p in all_players if not p["active"]]
-                inactive_ids = {p["matrix_id"] for p in inactive}
-                known_ids    = active_ids | inactive_ids
+                known_ids    = active_ids | {p["matrix_id"] for p in inactive}
                 members = []
-                if room_obj:
-                    for mid, user in room_obj.users.items():
-                        if mid not in known_ids and mid != self.config.user_id:
+                try:
+                    from nio import RoomMembersResponse
+                    resp = await scan_client.joined_members(self.config.room_id)
+                    if isinstance(resp, RoomMembersResponse):
+                        for mid, member in resp.members.items():
+                            if mid in known_ids or mid == self.config.user_id:
+                                continue
                             if self.config.poll_sender_id and mid == self.config.poll_sender_id:
                                 continue
-                            name = user.display_name or mid.split(":")[0].lstrip("@")
-                            members.append((mid, name, False))  # (id, name, is_inactive)
+                            name = member.display_name or mid.split(":")[0].lstrip("@")
+                            members.append((mid, name, False))
+                    else:
+                        logger.warning("joined_members fehlgeschlagen: %s", resp)
+                except Exception as e:
+                    logger.warning("Fehler beim Laden der Raum-Mitglieder: %s", e)
                 # Deaktivierte Spieler ganz unten
                 for p in inactive:
                     members.append((p["matrix_id"], f"↩️ {p['display_name']} (reaktivieren)", True))
