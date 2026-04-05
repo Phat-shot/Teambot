@@ -1706,6 +1706,7 @@ class TeamBot:
 
         event_id = await self._post_poll(self.config.room_id, poll_content)
         if event_id:
+            await self.db.close_all_open_votes()
             vote_date = game_date.strftime("%Y-%m-%d")
             vote_id   = await self.db.create_vote(event_id, vote_date)
             logger.info("Poll gestartet – event_id=%s vote_id=%d", event_id, vote_id)

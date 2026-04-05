@@ -297,6 +297,11 @@ class Database:
         await self._db.execute("UPDATE votes SET closed = 1 WHERE id = ?", (vote_id,))
         await self._db.commit()
 
+    async def close_all_open_votes(self):
+        """Alle offenen Votes schließen – wird beim Start eines neuen Votes aufgerufen."""
+        await self._db.execute("UPDATE votes SET closed = 1 WHERE closed = 0")
+        await self._db.commit()
+
     # ------------------------------------------------------------------
     # GK requests
     # ------------------------------------------------------------------
