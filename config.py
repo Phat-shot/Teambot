@@ -1,3 +1,5 @@
+from typing import Optional
+
 import yaml
 from dataclasses import dataclass
 
@@ -29,6 +31,11 @@ class Config:
 
     vote_yes: str = "✅"
     vote_no: str = "❌"
+
+    # Standort für Wettervorhersage im Vote-Poll (Open-Meteo, kein API-Key nötig)
+    # Leer lassen → keine Wetteranzeige.
+    weather_lat: Optional[float] = None
+    weather_lon: Optional[float] = None
 
 
 def load_config(path: str = "config.yml") -> Config:

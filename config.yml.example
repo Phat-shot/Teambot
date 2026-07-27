@@ -22,6 +22,11 @@ game_minute: 0
 vote_yes: "✅"
 vote_no: "❌"
 
+# Standort für Wettervorhersage im Vote-Poll (Open-Meteo, kein API-Key nötig).
+# Auskommentiert lassen wenn keine Wetteranzeige gewünscht ist.
+# weather_lat: 52.5200
+# weather_lon: 13.4050
+
 # Optionaler zweiter Account für Poll-Versand (WA-Bridge-Workaround)
 # Polls werden von diesem User gesendet damit die WA-Bridge sie akzeptiert.
 # Leer lassen wenn nicht benötigt.

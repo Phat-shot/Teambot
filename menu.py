@@ -139,13 +139,15 @@ def score_poll() -> dict:
     return make_poll("📊 Score vergeben (0–10):", _with_back(answers))
 
 
-def matchday_menu_poll(vote_open: bool) -> dict:
+def matchday_menu_poll(vote_open: bool, weather_threshold: float = 20.0) -> dict:
+    weather_entry = ("md_weather", f"🌡️ Wetter-Schwelle ({weather_threshold:g}°C)")
     if vote_open:
         return make_poll(
             "📅 Matchday – Vote ist offen:",
             _with_back([
                 ("md_team",   "⚽ Team erstellen"),
                 ("md_result", "📝 Ergebnis eintragen"),
+                weather_entry,
             ]),
         )
     else:
@@ -154,6 +156,7 @@ def matchday_menu_poll(vote_open: bool) -> dict:
             _with_back([
                 ("md_vote",   "🗓️ Vote starten"),
                 ("md_result", "📝 Ergebnis eintragen"),
+                weather_entry,
             ]),
         )
 

@@ -30,6 +30,7 @@ import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
+import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from nio import (
@@ -62,6 +63,9 @@ MAX_VOTE_AGE_SECONDS = 3 * 24 * 3600    # Vote gilt nach 3 Tagen als veraltet (v
 
 THOMAS_PLAYER_NUMBER = "0014"
 SETTING_THOMAS_PIN = "thomas_pin_gelb"
+
+SETTING_WEATHER_THRESHOLD = "weather_threshold_c"
+DEFAULT_WEATHER_THRESHOLD = 20.0
 
 logger = logging.getLogger(__name__)
 
@@ -1457,7 +1461,8 @@ class TeamBot:
                 state.category = "matchday"
                 state.level = 2
                 vote = await self.db.get_open_vote()
-                pid = await self._post_poll(room_id, matchday_menu_poll(bool(vote)))
+                threshold = await self.db.get_setting(SETTING_WEATHER_THRESHOLD, DEFAULT_WEATHER_THRESHOLD)
+                pid = await self._post_poll(room_id, matchday_menu_poll(bool(vote), threshold))
                 if pid: state.poll_event_ids.append(pid)
 
             elif answer == "cat_team":
@@ -1601,6 +1606,17 @@ class TeamBot:
                 state.level = 3
                 pid = await self.send("✏️ **Ergebnis eintragen**\nFormat: `3:2`", room_id)
                 state.prompt_msg_id = pid
+            elif answer == "md_weather":
+                state.command = "weather_threshold"
+                state.level = 3
+                current = await self.db.get_setting(SETTING_WEATHER_THRESHOLD, DEFAULT_WEATHER_THRESHOLD)
+                pid = await self.send(
+                    f"✏️ **Wetter-Schwelle einstellen**\n"
+                    f"Aktuell: {current:g}°C – Temperatur wird nur ab dieser Schwelle im Vote-Poll angezeigt.\n"
+                    f"Neue Zahl eingeben (°C):",
+                    room_id,
+                )
+                state.prompt_msg_id = pid
 
         # ── Level 2: Team-Untermenü ───────────────────────────────────────
         elif state.category == "team" and state.level == 2:
@@ -1677,6 +1693,19 @@ class TeamBot:
                 await self._match_setgk([text.strip()], room_id=room_id)
             elif cmd == "match_switched":
                 await self._match_switched([text.strip()], room_id=room_id)
+            elif cmd == "weather_threshold":
+                try:
+                    value = float(text.strip().replace(",", ".").replace("°C", "").replace("°", ""))
+                except ValueError:
+                    await self.send("❌ Bitte eine Zahl eingeben, z.B. `20`.", room_id)
+                else:
+                    await self.db.set_setting(SETTING_WEATHER_THRESHOLD, value)
+                    await self.send(
+                        f"✅ Wetter-Schwelle auf **{value:g}°C** gesetzt.\n"
+                        f"Temperatur wird ab jetzt nur noch im Vote-Poll angezeigt, wenn "
+                        f"die Vorhersage für den Spieltag diesen Wert erreicht.",
+                        room_id,
+                    )
         except Exception as exc:
             logger.exception("Menü-Fehler cmd=%s", cmd)
             await self.send(f"❌ Fehler: {exc}", room_id)
@@ -1756,6 +1785,36 @@ class TeamBot:
     # Scheduled jobs
     # ─────────────────────────────────────────────────────────────────────────
 
+    async def _fetch_game_temp(self, game_date: datetime) -> Optional[float]:
+        """Vorhergesagte Temperatur (°C) am Spieltag zur Spielstunde – via Open-Meteo
+        (kostenlos, kein API-Key). Gibt None zurück wenn kein Standort konfiguriert
+        oder die Vorhersage (noch) nicht verfügbar ist."""
+        if self.config.weather_lat is None or self.config.weather_lon is None:
+            return None
+        date_str = game_date.strftime("%Y-%m-%d")
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    "https://api.open-meteo.com/v1/forecast",
+                    params={
+                        "latitude": self.config.weather_lat,
+                        "longitude": self.config.weather_lon,
+                        "hourly": "temperature_2m",
+                        "timezone": "Europe/Berlin",
+                        "start_date": date_str,
+                        "end_date": date_str,
+                    },
+                )
+                data = resp.json()
+            times = data.get("hourly", {}).get("time", [])
+            temps = data.get("hourly", {}).get("temperature_2m", [])
+            target = f"{date_str}T{self.config.game_hour:02d}:00"
+            if target in times:
+                return temps[times.index(target)]
+        except Exception as exc:
+            logger.warning("Wetter-Abruf fehlgeschlagen: %s", exc)
+        return None
+
     async def _scheduled_vote(self):
         now        = datetime.now()
         days_ahead = (6 - now.weekday()) % 7
@@ -1771,6 +1830,11 @@ class TeamBot:
             f"Kicken Sonntag, {game_date_str} um "
             f"{cfg.game_hour:02d}:{cfg.game_minute:02d} Uhr"
         )
+
+        temp = await self._fetch_game_temp(game_date)
+        threshold = await self.db.get_setting(SETTING_WEATHER_THRESHOLD, DEFAULT_WEATHER_THRESHOLD)
+        if temp is not None and temp >= threshold:
+            title += f" · ☀️ {temp:.0f}°C erwartet"
 
         poll_content = make_poll(
             f"⚽ {title}",
