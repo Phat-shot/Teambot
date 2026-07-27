@@ -81,6 +81,25 @@ def build_teams(
     return t1_field, gk1, t2_field, gk2
 
 
+def pin_team_color(
+    t1_field: List[Dict],
+    gk1: Optional[Dict],
+    t2_field: List[Dict],
+    gk2: Optional[Dict],
+    matrix_id: str,
+) -> Tuple[List[Dict], Optional[Dict], List[Dict], Optional[Dict]]:
+    """Stellt sicher, dass der Spieler mit matrix_id in Team 1 (Gelb) spielt.
+    Verschiebt dafür KEINE einzelnen Spieler – die Snake-Draft-Gruppierung bleibt
+    unangetastet. Ist der Spieler in Team 2 gelandet, werden die beiden kompletten
+    Teams inkl. Torwart als Ganzes vertauscht, sodass sein Team zu Team 1 (Gelb) wird."""
+    in_team2 = (gk2 and gk2.get("matrix_id") == matrix_id) or any(
+        p.get("matrix_id") == matrix_id for p in t2_field
+    )
+    if in_team2:
+        return t2_field, gk2, t1_field, gk1
+    return t1_field, gk1, t2_field, gk2
+
+
 def _match_guests_to_hosts(
     t1_field: List[Dict],
     t2_field: List[Dict],

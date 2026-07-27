@@ -44,19 +44,24 @@ from nio import (
 )
 
 from config import Config
-from db import Database
+from db import Database, clean_display_name
 from menu import (MenuManager, MenuState,
                   main_menu_poll, player_menu_poll, player_select_poll,
                   room_members_poll, score_poll,
                   matchday_menu_poll, team_menu_poll)
 from poll import make_poll, POLL_EVENT_TYPE, POLL_RESPONSE_TYPES, POLL_RESPONSE_KEYS
-from teams import build_teams, format_teams, format_teams_main, effective_score, TEAM1_NAME, TEAM2_NAME
+from teams import (build_teams, format_teams, format_teams_main, effective_score,
+                    pin_team_color, TEAM1_NAME, TEAM2_NAME)
 
 TEAM1_LABEL = TEAM1_NAME
 TEAM2_LABEL = TEAM2_NAME
 
 SYNC_TOKEN_PATH = "data/sync_token"
 MAX_EVENT_AGE_SECONDS = 7 * 24 * 3600   # 1 Woche
+MAX_VOTE_AGE_SECONDS = 3 * 24 * 3600    # Vote gilt nach 3 Tagen als veraltet (verpasster Scheduler-Lauf)
+
+THOMAS_PLAYER_NUMBER = "0014"
+SETTING_THOMAS_PIN = "thomas_pin_gelb"
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +154,7 @@ class TeamBot:
 
     async def start(self):
         await self.db.connect()
+        await self._restore_runtime_state()
 
         resp = await self.client.login(self.config.password)
         if not isinstance(resp, LoginResponse):
@@ -263,6 +269,39 @@ class TeamBot:
         self._proposal_poll_id = None
         self._proposal_votes   = {}
         # _guests wird NICHT hier zurückgesetzt – nur bei neuem Vote-Start
+
+    async def _persist_runtime_state(self):
+        """Team-Vorschläge/Admin-Poll-State reboot-fest in der DB sichern.
+        Diese Werte lagen früher nur im RAM – ein Container-Neustart hat sie
+        (und damit alle bis dahin gesammelten Vorschlags-Stimmen) gelöscht."""
+        state = {
+            "proposal_poll_id":    self._proposal_poll_id,
+            "proposals":           self._proposals,
+            "proposal_votes":      self._proposal_votes,
+            "proposal_players":    list(self._proposal_players),
+            "active_proposal":     self._active_proposal,
+            "guests":              self._guests,
+            "admin_team_poll_id":  self._admin_team_poll_id,
+            "admin_team_poll_map": self._admin_team_poll_map,
+        }
+        await self.db.set_setting("runtime_state", state)
+
+    async def _restore_runtime_state(self):
+        state = await self.db.get_setting("runtime_state")
+        if not state:
+            return
+        self._proposal_poll_id    = state.get("proposal_poll_id")
+        self._proposals           = {k: tuple(v) for k, v in state.get("proposals", {}).items()}
+        self._proposal_votes      = state.get("proposal_votes", {})
+        self._proposal_players    = frozenset(state.get("proposal_players", []))
+        self._active_proposal     = state.get("active_proposal")
+        self._guests               = state.get("guests", [])
+        self._admin_team_poll_id  = state.get("admin_team_poll_id")
+        self._admin_team_poll_map = state.get("admin_team_poll_map", {})
+        if self._active_proposal and self._active_proposal in self._proposals:
+            self._activate_proposal(self._active_proposal)
+        logger.info("Runtime-State wiederhergestellt – Vorschläge: %s",
+                    sorted(self._proposals.keys()) or "–")
 
     def _current_teams_text(self) -> str:
         return format_teams(self._t1_field, self._t1_gk, self._t2_field, self._t2_gk)
@@ -434,7 +473,7 @@ class TeamBot:
                 room_obj = self.client.rooms.get(self.config.room_id)
                 sender_display = event.sender
                 if room_obj and event.sender in room_obj.users:
-                    sender_display = room_obj.users[event.sender].display_name or event.sender
+                    sender_display = clean_display_name(room_obj.users[event.sender].display_name or event.sender)
                 await self._add_reaction_guests(event.sender, sender_display, count)
             elif key == "🥅":
                 await self.db.add_gk_request(vote["id"], event.sender)
@@ -489,6 +528,7 @@ class TeamBot:
                         self._proposal_votes[letter] = self._proposal_votes.get(letter, 0) + 1
                         self._proposal_votes[letter + "_voter_" + event.sender] = 1
                         logger.info("Proposal vote: %s → %s", event.sender, letter)
+                        await self._persist_runtime_state()
                 return
 
             vote = await self.db.get_vote_by_event(poll_event_id)
@@ -554,7 +594,7 @@ class TeamBot:
             room_obj = self.client.rooms.get(self.config.room_id)
             sender_display = event.sender
             if room_obj and event.sender in room_obj.users:
-                sender_display = room_obj.users[event.sender].display_name or event.sender
+                sender_display = clean_display_name(room_obj.users[event.sender].display_name or event.sender)
             await self._add_reaction_guests(event.sender, sender_display, count)
             return
 
@@ -645,11 +685,9 @@ class TeamBot:
         if player:
             return  # bereits bekannt
 
-        # Anzeigename aus Matrix-Profil holen
-        display_name = matrix_id
-        room_obj = self.client.rooms.get(self.config.room_id)
-        if room_obj and matrix_id in room_obj.users:
-            display_name = room_obj.users[matrix_id].display_name or matrix_id
+        # Anzeigename aus Matrix-Profil holen (Profil-API statt Room-Cache – zuverlässiger
+        # kurz nach Beitritt/erstem Vote; "(WA)"-Bridge-Suffix wird entfernt)
+        display_name = await self._get_display_name(matrix_id)
 
         # Spieler anlegen: Skill 5, kein GK
         player_id = await self.db.add_player(matrix_id, display_name, can_gk=False)
@@ -1211,6 +1249,7 @@ class TeamBot:
                 , room_id)
 
             self._activate_proposal(letter)
+            await self._persist_runtime_state()
             await self.send(
                 f"✅ **Vorschlag {letter}** ist jetzt aktiv.\n\n"
                 + self._current_teams_text()
@@ -1233,6 +1272,18 @@ class TeamBot:
                 "Admin kann mit `!vote` einen neuen Vote starten."
             , room_id)
 
+        # Schutz nach verpasstem Scheduler-Lauf (z.B. Container-Neustart über Samstag):
+        # kein automatisches Team aus einem veralteten, nicht selbst erstellten Vote.
+        vote_age = (
+            datetime.utcnow() - datetime.strptime(vote["created_at"], "%Y-%m-%d %H:%M:%S")
+        ).total_seconds()
+        if vote_age > MAX_VOTE_AGE_SECONDS:
+            return await self.send(
+                f"⚠️ Der offene Vote ist vom {vote['vote_date']} und wirkt veraltet – "
+                f"vermutlich wurde der wöchentliche Poll-Start verpasst (z.B. Bot-Neustart).\n"
+                f"Kein automatisches Team. Admin kann mit `!vote` einen frischen Vote starten.",
+                room_id,
+            )
 
         yes_ids = await self.db.get_vote_yes_players(vote["id"])
         if not yes_ids:
@@ -1283,8 +1334,17 @@ class TeamBot:
 
         t1f, gk1, t2f, gk2 = build_teams(players, gk_requests)
 
+        # Thomas-Team-Toggle: Thomas Kirchhof (Spieler #0014) spielt fix in Team Gelb.
+        # Snake-Draft entscheidet wie gewohnt über die Gruppierung – landet Thomas dabei
+        # in Team Bunt, werden die beiden kompletten Teams (nicht einzelne Spieler) getauscht.
+        thomas = await self.db.get_player_by_number(THOMAS_PLAYER_NUMBER)
+        if thomas and await self.db.get_setting(SETTING_THOMAS_PIN, True):
+            if thomas["matrix_id"] in {p.get("matrix_id") for p in players}:
+                t1f, gk1, t2f, gk2 = pin_team_color(t1f, gk1, t2f, gk2, thomas["matrix_id"])
+
         self._proposals[next_letter] = (t1f, gk1, t2f, gk2)
         self._activate_proposal(next_letter)
+        await self._persist_runtime_state()
 
         n_proposals = len(self._proposals)
         hint = ""
@@ -1403,7 +1463,8 @@ class TeamBot:
             elif answer == "cat_team":
                 state.category = "team"
                 state.level = 2
-                pid = await self._post_poll(room_id, team_menu_poll())
+                thomas_pin = await self.db.get_setting(SETTING_THOMAS_PIN, True)
+                pid = await self._post_poll(room_id, team_menu_poll(thomas_pin))
                 if pid: state.poll_event_ids.append(pid)
 
         # ── Level 2: Spieler-Untermenü ────────────────────────────────────
@@ -1426,7 +1487,7 @@ class TeamBot:
                                 continue
                             if self.config.poll_sender_id and mid == self.config.poll_sender_id:
                                 continue
-                            name = member.display_name or mid.split(":")[0].lstrip("@")
+                            name = clean_display_name(member.display_name or mid.split(":")[0].lstrip("@"))
                             members.append((mid, name, False))
                     else:
                         logger.warning("joined_members fehlgeschlagen: %s", resp)
@@ -1584,6 +1645,17 @@ class TeamBot:
                 else:
                     await self.send("⚠️ Kein Team aktiv.", room_id)
                 self._menu.clear(room_id)
+            elif answer == "tm_thomas":
+                current = await self.db.get_setting(SETTING_THOMAS_PIN, True)
+                await self.db.set_setting(SETTING_THOMAS_PIN, not current)
+                status = "aktiviert" if not current else "deaktiviert"
+                await self.send(
+                    f"🟡 Thomas-Team-Toggle {status}.\n"
+                    f"Thomas Kirchhof (#{THOMAS_PLAYER_NUMBER}) landet ab dem nächsten "
+                    f"Team-Vorschlag {'immer in Team Gelb' if not current else 'wieder normal per Snake-Draft'}.",
+                    room_id,
+                )
+                self._menu.clear(room_id)
 
     async def _menu_handle_text(self, room_id: str, text: str, sender: str):
         state = self._menu.get(room_id)
@@ -1640,15 +1712,16 @@ class TeamBot:
             )
 
     async def _get_display_name(self, matrix_id: str) -> str:
-        """Display Name aus Matrix-Profil holen, Fallback auf Localpart."""
+        """Display Name aus Matrix-Profil holen, Fallback auf Localpart.
+        WhatsApp-Bridge-Suffix "(WA)" wird entfernt."""
         try:
             resp = await self.client.get_displayname(matrix_id)
             if hasattr(resp, "displayname") and resp.displayname:
-                return resp.displayname
+                return clean_display_name(resp.displayname)
         except Exception:
             pass
         # Fallback: @localpart:server → localpart
-        return matrix_id.split(":")[0].lstrip("@")
+        return clean_display_name(matrix_id.split(":")[0].lstrip("@"))
 
     async def _menu_redact_all(self, room_id: str, state):
         """Alle offenen Poll-Nachrichten des States löschen."""
@@ -1712,6 +1785,7 @@ class TeamBot:
             logger.info("Poll gestartet – event_id=%s vote_id=%d", event_id, vote_id)
             self._reset_proposals()
             self._guests = []  # Gästeliste bei neuem Vote zurücksetzen
+            await self._persist_runtime_state()
         else:
             logger.error("Poll konnte nicht gepostet werden")
 
@@ -1733,6 +1807,7 @@ class TeamBot:
 
         winner = max(real_votes, key=lambda k: real_votes[k])
         self._activate_proposal(winner)
+        await self._persist_runtime_state()
         votes_summary = " · ".join(
             f"{l}: {real_votes.get(l, 0)} Stimme(n)"
             for l in sorted(self._proposals)
@@ -1771,6 +1846,7 @@ class TeamBot:
         if event_id:
             self._proposal_poll_id = event_id
             self._proposal_votes   = {}
+            await self._persist_runtime_state()
             await self.send(
                 f"📋 Vorschläge zur Abstimmung:\n{preview}\n\n"
                 f"Um 10:00 Uhr wird der meistgewählte Vorschlag aktiviert.\n"
@@ -1825,6 +1901,7 @@ class TeamBot:
         if event_id:
             self._admin_team_poll_id = event_id
             logger.info("Admin-Team-Poll gepostet: %s", event_id)
+            await self._persist_runtime_state()
 
     async def _handle_admin_team_poll_reaction(self, room, event):
         """Reaktion auf den Admin-Team-Poll verarbeiten."""

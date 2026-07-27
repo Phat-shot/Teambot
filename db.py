@@ -13,11 +13,19 @@ Tables:
 import json
 import logging
 import os
+import re
 from typing import Dict, List, Optional
 
 import aiosqlite
 
 logger = logging.getLogger(__name__)
+
+# WhatsApp-Bridge (mautrix-whatsapp) hängt Puppet-Displaynamen ein "(WA)"-Suffix an.
+WA_SUFFIX_RE = re.compile(r"\s*\(WA\)\s*$", re.IGNORECASE)
+
+
+def clean_display_name(name: str) -> str:
+    return WA_SUFFIX_RE.sub("", name or "").strip()
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -89,6 +97,11 @@ CREATE TABLE IF NOT EXISTS injured_requests (
     requested_at TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(vote_id, matrix_id)
 );
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -139,6 +152,21 @@ class Database:
             )
         if rows:
             await self._db.commit()  # already exists or not applicable
+
+        # Bestehende Spieler mit "(WA)"-Suffix im Namen (WhatsApp-Bridge) bereinigen
+        async with self._db.execute(
+            "SELECT id, display_name FROM players WHERE display_name LIKE '%(WA)%'"
+        ) as cur:
+            wa_rows = await cur.fetchall()
+        for row in wa_rows:
+            cleaned = clean_display_name(row["display_name"])
+            if cleaned and cleaned != row["display_name"]:
+                await self._db.execute(
+                    "UPDATE players SET display_name=? WHERE id=?", (cleaned, row["id"])
+                )
+        if wa_rows:
+            await self._db.commit()
+            logger.info("%d Spielername(n) um '(WA)'-Suffix bereinigt", len(wa_rows))
 
     async def close(self):
         if self._db:
@@ -495,6 +523,30 @@ class Database:
             if val is None:
                 return default
             return float(val)
+
+    # ------------------------------------------------------------------
+    # Settings – persistenter Key/Value-Store (JSON-Werte)
+    # ------------------------------------------------------------------
+
+    async def get_setting(self, key: str, default=None):
+        async with self._db.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+            if not row:
+                return default
+            try:
+                return json.loads(row["value"])
+            except (TypeError, ValueError):
+                return default
+
+    async def set_setting(self, key: str, value) -> None:
+        await self._db.execute(
+            """INSERT INTO settings (key, value) VALUES (?,?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (key, json.dumps(value)),
+        )
+        await self._db.commit()
 
 
 def _goal_diff_to_score(goal_diff: int) -> float:

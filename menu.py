@@ -158,7 +158,8 @@ def matchday_menu_poll(vote_open: bool) -> dict:
         )
 
 
-def team_menu_poll() -> dict:
+def team_menu_poll(thomas_pin: bool = True) -> dict:
+    thomas_label = "🟡✅ Thomas-Team-Toggle (an)" if thomas_pin else "🟡❌ Thomas-Team-Toggle (aus)"
     return make_poll(
         "⚽ Team – Was möchtest du tun?",
         _with_back([
@@ -170,5 +171,6 @@ def team_menu_poll() -> dict:
             ("tm_gk",      "🧤 Torwart setzen"),
             ("tm_switch",  "🔕 Spieler nicht werten"),
             ("tm_announce","📣 Team ankündigen"),
+            ("tm_thomas",  thomas_label),
         ]),
     )
